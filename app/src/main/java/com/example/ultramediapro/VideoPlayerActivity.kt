@@ -7,7 +7,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
-import android.os.ParcelFileDescriptor
 import android.util.Rational
 import android.view.WindowManager
 import android.widget.Toast
@@ -52,7 +51,6 @@ class VideoPlayerActivity : ComponentActivity() {
     private lateinit var libVLC: LibVLC
     private lateinit var mediaPlayer: MediaPlayer
     private var sleepTimer: CountDownTimer? = null
-    private var pfd: ParcelFileDescriptor? = null
     private var isBackgroundAudioMode = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,11 +58,7 @@ class VideoPlayerActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
 
-        val videoUriString = intent.getStringExtra("VIDEO_URI")
-        if (videoUriString == null) {
-            finish()
-            return
-        }
+        val videoUriString = intent.getStringExtra("VIDEO_URI") ?: return finish()
         val videoTitle = intent.getStringExtra("VIDEO_TITLE") ?: "Video"
 
         val options = ArrayList<String>().apply {
@@ -74,13 +68,7 @@ class VideoPlayerActivity : ComponentActivity() {
         libVLC = LibVLC(this, options)
         mediaPlayer = MediaPlayer(libVLC)
 
-        val uri = Uri.parse(videoUriString)
-        pfd = try {
-            contentResolver.openFileDescriptor(uri, "r")
-        } catch (_: Exception) {
-            null
-        }
-        val media = pfd?.fileDescriptor?.let { Media(libVLC, it) } ?: Media(libVLC, uri)
+        val media = Media(libVLC, Uri.parse(videoUriString))
         media.setHWDecoderEnabled(true, false)
         mediaPlayer.setMedia(media)
         media.release()
@@ -163,9 +151,6 @@ class VideoPlayerActivity : ComponentActivity() {
         mediaPlayer.detachViews()
         mediaPlayer.release()
         libVLC.release()
-        try {
-            pfd?.close()
-        } catch (_: Exception) { }
     }
 }
 
@@ -188,7 +173,7 @@ fun VlcStylePlayerScreen(
     var currentTime by remember { mutableLongStateOf(0L) }
     var totalDuration by remember { mutableLongStateOf(1L) }
     var overlayText by remember { mutableStateOf("") }
-    var zoomMode by remember { mutableIntStateOf(0) }
+    var zoomMode by remember { mutableIntStateOf(0) } // 0=Normal, 1=Fill, 2=16:9
     var currentVolume by remember { mutableIntStateOf(100) }
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
 
@@ -228,10 +213,10 @@ fun VlcStylePlayerScreen(
                     onDoubleTap = { offset ->
                         if (!isLocked) {
                             if (offset.x < size.width / 2) {
-                                mediaPlayer.setTime((mediaPlayer.time - 10000L).coerceAtLeast(0L))
+                                mediaPlayer.setTime((mediaPlayer.time - 10000).coerceAtLeast(0))
                                 overlayText = "-10s"
                             } else {
-                                mediaPlayer.setTime((mediaPlayer.time + 10000L).coerceAtMost(mediaPlayer.length))
+                                mediaPlayer.setTime((mediaPlayer.time + 10000).coerceAtMost(mediaPlayer.length))
                                 overlayText = "+10s"
                             }
                         }
@@ -419,7 +404,7 @@ fun VlcStylePlayerScreen(
                     mediaPlayer.setRate(playbackSpeed)
                 }
                 SideMenuItem(Icons.Rounded.HistoryToggleOff, "Jump to Time (+1m)") {
-                    mediaPlayer.setTime((mediaPlayer.time + 60000L).coerceAtMost(mediaPlayer.length))
+                    mediaPlayer.setTime((mediaPlayer.time + 60000).coerceAtMost(mediaPlayer.length))
                 }
                 SideMenuItem(Icons.Rounded.Tune, "Equalizer") { onShowEqualizer(); showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Headphones, "Play as audio") { onPlayAsAudio(); showSideMenu = false }
