@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
+import android.os.ParcelFileDescriptor
 import android.util.Rational
 import android.view.WindowManager
 import android.widget.Toast
@@ -22,8 +23,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
@@ -39,6 +42,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.delay
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
@@ -50,6 +56,7 @@ class VideoPlayerActivity : ComponentActivity() {
 
     private lateinit var libVLC: LibVLC
     private lateinit var mediaPlayer: MediaPlayer
+    private var currentPfd: ParcelFileDescriptor? = null
     private var sleepTimer: CountDownTimer? = null
     private var isBackgroundAudioMode = false
 
@@ -57,6 +64,7 @@ class VideoPlayerActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        hideSystemBars()
 
         val videoUriString = intent.getStringExtra("VIDEO_URI") ?: return finish()
         val videoTitle = intent.getStringExtra("VIDEO_TITLE") ?: "Video"
@@ -64,11 +72,24 @@ class VideoPlayerActivity : ComponentActivity() {
         val options = ArrayList<String>().apply {
             add("--aout=opensles")
             add("--audio-time-stretch")
+            add("--file-caching=1500")
         }
         libVLC = LibVLC(this, options)
         mediaPlayer = MediaPlayer(libVLC)
 
-        val media = Media(libVLC, Uri.parse(videoUriString))
+        // Android 11+ Scoped Storage-এ ভিডিও চালানোর জন্য ParcelFileDescriptor ব্যবহার
+        val uri = Uri.parse(videoUriString)
+        val media = try {
+            currentPfd = contentResolver.openFileDescriptor(uri, "r")
+            if (currentPfd != null) {
+                Media(libVLC, currentPfd!!.fileDescriptor)
+            } else {
+                Media(libVLC, uri)
+            }
+        } catch (_: Exception) {
+            Media(libVLC, uri)
+        }
+
         media.setHWDecoderEnabled(true, false)
         mediaPlayer.setMedia(media)
         media.release()
@@ -93,22 +114,35 @@ class VideoPlayerActivity : ComponentActivity() {
                     },
                     onSetSleepTimer = { minutes ->
                         sleepTimer?.cancel()
-                        sleepTimer = object : CountDownTimer(minutes * 60 * 1000L, 1000) {
-                            override fun onTick(millisUntilFinished: Long) {}
-                            override fun onFinish() {
-                                mediaPlayer.pause()
-                                finish()
-                            }
-                        }.start()
-                        Toast.makeText(this, "$minutes মিনিট পর ভিডিও বন্ধ হবে", Toast.LENGTH_SHORT).show()
+                        if (minutes == 0) {
+                            Toast.makeText(this, "Sleep timer বন্ধ করা হয়েছে", Toast.LENGTH_SHORT).show()
+                        } else {
+                            sleepTimer = object : CountDownTimer(minutes * 60 * 1000L, 1000) {
+                                override fun onTick(millisUntilFinished: Long) {}
+                                override fun onFinish() {
+                                    mediaPlayer.pause()
+                                    finish()
+                                }
+                            }.start()
+                            Toast.makeText(this, "$minutes মিনিট পর ভিডিও বন্ধ হবে", Toast.LENGTH_SHORT).show()
+                        }
                     },
-                    onSelectTracks = { showTrackSelectionDialog() },
-                    onShowEqualizer = {
-                        Toast.makeText(this, "VLC Hardware Audio Boost (200%) সক্রিয় আছে", Toast.LENGTH_SHORT).show()
-                    }
+                    onSelectTracks = { showTrackSelectionDialog() }
                 )
             }
         }
+    }
+
+    private fun hideSystemBars() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
     }
 
     private fun showTrackSelectionDialog() {
@@ -147,10 +181,13 @@ class VideoPlayerActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         sleepTimer?.cancel()
-        mediaPlayer.stop()
-        mediaPlayer.detachViews()
-        mediaPlayer.release()
-        libVLC.release()
+        try {
+            mediaPlayer.stop()
+            mediaPlayer.detachViews()
+            mediaPlayer.release()
+            libVLC.release()
+            currentPfd?.close()
+        } catch (_: Exception) { }
     }
 }
 
@@ -162,39 +199,42 @@ fun VlcStylePlayerScreen(
     onEnterPip: () -> Unit,
     onPlayAsAudio: () -> Unit,
     onSetSleepTimer: (Int) -> Unit,
-    onSelectTracks: () -> Unit,
-    onShowEqualizer: () -> Unit
+    onSelectTracks: () -> Unit
 ) {
     val context = LocalContext.current
     var isPlaying by remember { mutableStateOf(true) }
     var isLocked by remember { mutableStateOf(false) }
     var showControls by remember { mutableStateOf(true) }
     var showSideMenu by remember { mutableStateOf(false) }
+    var showEqDialog by remember { mutableStateOf(false) }
+    var showSleepDialog by remember { mutableStateOf(false) }
+    var showJumpDialog by remember { mutableStateOf(false) }
     var currentTime by remember { mutableLongStateOf(0L) }
     var totalDuration by remember { mutableLongStateOf(1L) }
     var overlayText by remember { mutableStateOf("") }
-    var zoomMode by remember { mutableIntStateOf(0) } // 0=Normal, 1=Fill, 2=16:9
+    var zoomMode by remember { mutableIntStateOf(0) }
     var currentVolume by remember { mutableIntStateOf(100) }
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
 
+    val vlcEq = remember { MediaPlayer.Equalizer.create() }
+    var eqEnabled by remember { mutableStateOf(false) }
+
     LaunchedEffect(showControls, showSideMenu) {
-        if (showControls || showSideMenu) {
+        if (showControls && !showSideMenu) {
             delay(4000)
             showControls = false
-            showSideMenu = false
         }
     }
 
     LaunchedEffect(Unit) {
         while (true) {
-            if (mediaPlayer.isPlaying) {
-                currentTime = mediaPlayer.time
-                totalDuration = mediaPlayer.length.coerceAtLeast(1L)
-                isPlaying = true
-            } else {
-                isPlaying = false
-            }
-            delay(500)
+            val playing = mediaPlayer.isPlaying
+            isPlaying = playing
+            val t = mediaPlayer.time
+            val len = mediaPlayer.length
+            if (t >= 0) currentTime = t
+            if (len > 0) totalDuration = len
+            delay(400)
         }
     }
 
@@ -206,8 +246,11 @@ fun VlcStylePlayerScreen(
                 detectTapGestures(
                     onTap = {
                         if (!isLocked) {
-                            showControls = !showControls
-                            if (!showControls) showSideMenu = false
+                            if (showSideMenu) {
+                                showSideMenu = false
+                            } else {
+                                showControls = !showControls
+                            }
                         }
                     },
                     onDoubleTap = { offset ->
@@ -251,7 +294,7 @@ fun VlcStylePlayerScreen(
             factory = { ctx ->
                 VLCVideoLayout(ctx).apply {
                     mediaPlayer.attachViews(this, null, false, false)
-                    mediaPlayer.play()
+                    post { mediaPlayer.play() }
                 }
             }
         )
@@ -276,20 +319,26 @@ fun VlcStylePlayerScreen(
                 onClick = { isLocked = false; showControls = true },
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(20.dp)
+                    .safeDrawingPadding()
+                    .padding(16.dp)
                     .background(Color(0x88000000), CircleShape)
             ) {
                 Icon(Icons.Rounded.Lock, contentDescription = "Unlock", tint = Color(0xFFFF8800))
             }
         }
 
+        // সেফ প্যাডিংসহ কন্ট্রোল (ফোনের ন্যাভিগেশন বাটনের সাথে কখনো মিশবে না)
         AnimatedVisibility(visible = showControls && !isLocked, enter = fadeIn(), exit = fadeOut()) {
-            Box(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .safeDrawingPadding()
+            ) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0x66000000))
-                        .padding(12.dp),
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = onBack) {
@@ -298,7 +347,7 @@ fun VlcStylePlayerScreen(
                     Text(
                         text = videoTitle,
                         color = Color.White,
-                        fontSize = 16.sp,
+                        fontSize = 15.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
@@ -309,7 +358,7 @@ fun VlcStylePlayerScreen(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .background(Color(0x88000000))
+                        .background(Color(0x99000000))
                         .padding(horizontal = 16.dp, vertical = 8.dp)
                 ) {
                     Row(
@@ -322,7 +371,11 @@ fun VlcStylePlayerScreen(
 
                     Slider(
                         value = (currentTime.toFloat() / totalDuration.toFloat()).coerceIn(0f, 1f),
-                        onValueChange = { mediaPlayer.setTime((it * totalDuration).toLong()) },
+                        onValueChange = {
+                            val target = (it * totalDuration).toLong()
+                            currentTime = target
+                            mediaPlayer.setTime(target)
+                        },
                         colors = SliderDefaults.colors(
                             thumbColor = Color(0xFFFF8800),
                             activeTrackColor = Color(0xFFFF8800)
@@ -352,7 +405,13 @@ fun VlcStylePlayerScreen(
 
                         IconButton(
                             onClick = {
-                                if (mediaPlayer.isPlaying) mediaPlayer.pause() else mediaPlayer.play()
+                                if (mediaPlayer.isPlaying) {
+                                    mediaPlayer.pause()
+                                    isPlaying = false
+                                } else {
+                                    mediaPlayer.play()
+                                    isPlaying = true
+                                }
                             },
                             modifier = Modifier.size(52.dp)
                         ) {
@@ -383,33 +442,118 @@ fun VlcStylePlayerScreen(
             }
         }
 
+        // VLC সাইড মেনু (সেফ প্যাডিংসহ)
         AnimatedVisibility(
             visible = showSideMenu && !isLocked,
             enter = slideInHorizontally(initialOffsetX = { it }),
             exit = slideOutHorizontally(targetOffsetX = { it }),
-            modifier = Modifier.align(Alignment.CenterEnd)
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .safeDrawingPadding()
         ) {
             Column(
                 modifier = Modifier
-                    .width(220.dp)
+                    .width(230.dp)
                     .fillMaxHeight()
-                    .background(Color(0xDD1E1A17))
+                    .background(Color(0xEE1E1A17))
+                    .verticalScroll(rememberScrollState())
                     .padding(16.dp),
-                verticalArrangement = Arrangement.SpaceEvenly
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 SideMenuItem(Icons.Rounded.LockOpen, "Lock") { isLocked = true; showSideMenu = false }
-                SideMenuItem(Icons.Rounded.Bedtime, "Sleep timer") { onSetSleepTimer(30); showSideMenu = false }
+                SideMenuItem(Icons.Rounded.Bedtime, "Sleep timer") { showSleepDialog = true; showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Speed, "Playback speed (${playbackSpeed}x)") {
                     playbackSpeed = if (playbackSpeed >= 2.0f) 0.5f else playbackSpeed + 0.25f
                     mediaPlayer.setRate(playbackSpeed)
                 }
-                SideMenuItem(Icons.Rounded.HistoryToggleOff, "Jump to Time (+1m)") {
-                    mediaPlayer.setTime((mediaPlayer.time + 60000).coerceAtMost(mediaPlayer.length))
-                }
-                SideMenuItem(Icons.Rounded.Tune, "Equalizer") { onShowEqualizer(); showSideMenu = false }
+                SideMenuItem(Icons.Rounded.HistoryToggleOff, "Jump to Time") { showJumpDialog = true; showSideMenu = false }
+                SideMenuItem(Icons.Rounded.Tune, "Equalizer") { showEqDialog = true; showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Headphones, "Play as audio") { onPlayAsAudio(); showSideMenu = false }
                 SideMenuItem(Icons.Rounded.PictureInPictureAlt, "Pop-Up player") { onEnterPip(); showSideMenu = false }
             }
+        }
+
+        // ১০-ব্যান্ড VLC ইকুলাইজার ডায়ালগ
+        if (showEqDialog) {
+            AlertDialog(
+                onDismissRequest = { showEqDialog = false },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                        Text("Video Equalizer")
+                        Switch(
+                            checked = eqEnabled,
+                            onCheckedChange = {
+                                eqEnabled = it
+                                mediaPlayer.setEqualizer(if (it) vlcEq else null)
+                            }
+                        )
+                    }
+                },
+                text = {
+                    Column(modifier = Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                        val bandCount = MediaPlayer.Equalizer.getBandCount()
+                        for (i in 0 until bandCount) {
+                            var amp by remember { mutableFloatStateOf(vlcEq.getAmp(i)) }
+                            val freq = MediaPlayer.Equalizer.getBandFrequency(i).toInt()
+                            val label = if (freq >= 1000) "${freq / 1000} kHz" else "$freq Hz"
+                            Text("$label (${amp.toInt()} dB)", fontSize = 12.sp)
+                            Slider(
+                                value = amp,
+                                valueRange = -20f..20f,
+                                enabled = eqEnabled,
+                                onValueChange = {
+                                    amp = it
+                                    vlcEq.setAmp(i, it)
+                                    if (eqEnabled) mediaPlayer.setEqualizer(vlcEq)
+                                }
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showEqDialog = false }) { Text("Done") }
+                }
+            )
+        }
+
+        // Sleep Timer ডায়ালগ
+        if (showSleepDialog) {
+            AlertDialog(
+                onDismissRequest = { showSleepDialog = false },
+                title = { Text("Sleep Timer") },
+                text = {
+                    Column {
+                        listOf(0 to "Off", 15 to "15 Minutes", 30 to "30 Minutes", 45 to "45 Minutes", 60 to "60 Minutes").forEach { (mins, text) ->
+                            TextButton(
+                                onClick = { onSetSleepTimer(mins); showSleepDialog = false },
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text(text) }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showSleepDialog = false }) { Text("Cancel") } }
+            )
+        }
+
+        // Jump to Time ডায়ালগ
+        if (showJumpDialog) {
+            AlertDialog(
+                onDismissRequest = { showJumpDialog = false },
+                title = { Text("Jump to Time") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
+                            Button(onClick = { mediaPlayer.setTime((mediaPlayer.time - 60000).coerceAtLeast(0)) }) { Text("-1m") }
+                            Button(onClick = { mediaPlayer.setTime((mediaPlayer.time + 60000).coerceAtMost(mediaPlayer.length)) }) { Text("+1m") }
+                        }
+                        Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
+                            Button(onClick = { mediaPlayer.setTime((mediaPlayer.time - 300000).coerceAtLeast(0)) }) { Text("-5m") }
+                            Button(onClick = { mediaPlayer.setTime((mediaPlayer.time + 300000).coerceAtMost(mediaPlayer.length)) }) { Text("+5m") }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showJumpDialog = false }) { Text("Done") } }
+            )
         }
     }
 }
@@ -430,6 +574,7 @@ fun SideMenuItem(icon: ImageVector, label: String, onClick: () -> Unit) {
 }
 
 fun formatMillis(ms: Long): String {
+    if (ms <= 0) return "00:00"
     val totalSecs = ms / 1000
     val hrs = totalSecs / 3600
     val mins = (totalSecs % 3600) / 60
