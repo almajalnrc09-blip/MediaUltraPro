@@ -1,18 +1,14 @@
 package com.example.ultramediapro
 
-import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.app.PictureInPictureParams
-import android.content.Intent
 import android.content.pm.ActivityInfo
-import android.media.audiofx.Equalizer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
+import android.os.ParcelFileDescriptor
 import android.util.Rational
-import android.view.GestureDetector
-import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -56,6 +52,7 @@ class VideoPlayerActivity : ComponentActivity() {
     private lateinit var libVLC: LibVLC
     private lateinit var mediaPlayer: MediaPlayer
     private var sleepTimer: CountDownTimer? = null
+    private var pfd: ParcelFileDescriptor? = null
     private var isBackgroundAudioMode = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -63,7 +60,11 @@ class VideoPlayerActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
 
-        val videoUriString = intent.getStringExtra("VIDEO_URI") ?: return finish()
+        val videoUriString = intent.getStringExtra("VIDEO_URI")
+        if (videoUriString == null) {
+            finish()
+            return
+        }
         val videoTitle = intent.getStringExtra("VIDEO_TITLE") ?: "Video"
 
         val options = ArrayList<String>().apply {
@@ -73,9 +74,15 @@ class VideoPlayerActivity : ComponentActivity() {
         libVLC = LibVLC(this, options)
         mediaPlayer = MediaPlayer(libVLC)
 
-        val media = Media(libVLC, Uri.parse(videoUriString))
+        val uri = Uri.parse(videoUriString)
+        pfd = try {
+            contentResolver.openFileDescriptor(uri, "r")
+        } catch (_: Exception) {
+            null
+        }
+        val media = pfd?.fileDescriptor?.let { Media(libVLC, it) } ?: Media(libVLC, uri)
         media.setHWDecoderEnabled(true, false)
-        mediaPlayer.media = media
+        mediaPlayer.setMedia(media)
         media.release()
 
         setContent {
@@ -124,11 +131,11 @@ class VideoPlayerActivity : ComponentActivity() {
 
         audioTracks.forEach { track ->
             items.add("Audio: ${track.name}")
-            actions.add { mediaPlayer.audioTrack = track.id }
+            actions.add { mediaPlayer.setAudioTrack(track.id) }
         }
         subTracks.forEach { track ->
             items.add("Subtitle: ${track.name}")
-            actions.add { mediaPlayer.spuTrack = track.id }
+            actions.add { mediaPlayer.setSpuTrack(track.id) }
         }
 
         if (items.isEmpty()) {
@@ -156,6 +163,9 @@ class VideoPlayerActivity : ComponentActivity() {
         mediaPlayer.detachViews()
         mediaPlayer.release()
         libVLC.release()
+        try {
+            pfd?.close()
+        } catch (_: Exception) { }
     }
 }
 
@@ -178,11 +188,10 @@ fun VlcStylePlayerScreen(
     var currentTime by remember { mutableLongStateOf(0L) }
     var totalDuration by remember { mutableLongStateOf(1L) }
     var overlayText by remember { mutableStateOf("") }
-    var zoomMode by remember { mutableIntStateOf(0) } // 0=Normal, 1=Fill, 2=16:9
+    var zoomMode by remember { mutableIntStateOf(0) }
     var currentVolume by remember { mutableIntStateOf(100) }
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
 
-    // কন্ট্রোল ও সাইড মেনু অটোমেটিক হাইড হওয়া
     LaunchedEffect(showControls, showSideMenu) {
         if (showControls || showSideMenu) {
             delay(4000)
@@ -191,7 +200,6 @@ fun VlcStylePlayerScreen(
         }
     }
 
-    // প্লেব্যাক টাইম আপডেট
     LaunchedEffect(Unit) {
         while (true) {
             if (mediaPlayer.isPlaying) {
@@ -220,10 +228,10 @@ fun VlcStylePlayerScreen(
                     onDoubleTap = { offset ->
                         if (!isLocked) {
                             if (offset.x < size.width / 2) {
-                                mediaPlayer.time = (mediaPlayer.time - 10000).coerceAtLeast(0)
+                                mediaPlayer.setTime((mediaPlayer.time - 10000L).coerceAtLeast(0L))
                                 overlayText = "-10s"
                             } else {
-                                mediaPlayer.time = (mediaPlayer.time + 10000).coerceAtMost(mediaPlayer.length)
+                                mediaPlayer.setTime((mediaPlayer.time + 10000L).coerceAtMost(mediaPlayer.length))
                                 overlayText = "+10s"
                             }
                         }
@@ -246,14 +254,13 @@ fun VlcStylePlayerScreen(
                             overlayText = "Brightness: ${(next * 100).toInt()}%"
                         } else {
                             currentVolume = (currentVolume + delta.toInt()).coerceIn(0, 200)
-                            mediaPlayer.volume = currentVolume
+                            mediaPlayer.setVolume(currentVolume)
                             overlayText = "Volume: $currentVolume%"
                         }
                     }
                 }
             }
     ) {
-        // VLC ভিডিও সারফেস
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
@@ -264,7 +271,6 @@ fun VlcStylePlayerScreen(
             }
         )
 
-        // ওভারলে টেক্সট (ভলিউম/ব্রাইটনেস/স্কিপ)
         if (overlayText.isNotEmpty()) {
             LaunchedEffect(overlayText) {
                 delay(1200)
@@ -280,7 +286,6 @@ fun VlcStylePlayerScreen(
             }
         }
 
-        // লক অবস্থায় আনলক বাটন
         if (isLocked) {
             IconButton(
                 onClick = { isLocked = false; showControls = true },
@@ -293,10 +298,8 @@ fun VlcStylePlayerScreen(
             }
         }
 
-        // মেইন কন্ট্রোল (উপরে ও নিচে)
         AnimatedVisibility(visible = showControls && !isLocked, enter = fadeIn(), exit = fadeOut()) {
             Box(modifier = Modifier.fillMaxSize()) {
-                // উপরের বার (টাইটেল)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -317,7 +320,6 @@ fun VlcStylePlayerScreen(
                     )
                 }
 
-                // নিচের বার (VLC স্ক্রিনশটের মতো কমলা স্লাইডার ও বাটনসমূহ)
                 Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -335,7 +337,7 @@ fun VlcStylePlayerScreen(
 
                     Slider(
                         value = (currentTime.toFloat() / totalDuration.toFloat()).coerceIn(0f, 1f),
-                        onValueChange = { mediaPlayer.time = (it * totalDuration).toLong() },
+                        onValueChange = { mediaPlayer.setTime((it * totalDuration).toLong()) },
                         colors = SliderDefaults.colors(
                             thumbColor = Color(0xFFFF8800),
                             activeTrackColor = Color(0xFFFF8800)
@@ -347,7 +349,6 @@ fun VlcStylePlayerScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // অডিও/সাবটাইটেল ট্র্যাক ও জুম মোড
                         Row {
                             IconButton(onClick = onSelectTracks) {
                                 Icon(Icons.Rounded.Subtitles, contentDescription = "Tracks", tint = Color.White)
@@ -355,16 +356,15 @@ fun VlcStylePlayerScreen(
                             IconButton(onClick = {
                                 zoomMode = (zoomMode + 1) % 3
                                 when (zoomMode) {
-                                    0 -> { mediaPlayer.videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT; overlayText = "Normal" }
-                                    1 -> { mediaPlayer.videoScale = MediaPlayer.ScaleType.SURFACE_FILL; overlayText = "Fill" }
-                                    2 -> { mediaPlayer.videoScale = MediaPlayer.ScaleType.SURFACE_16_9; overlayText = "16:9" }
+                                    0 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT); overlayText = "Normal" }
+                                    1 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FILL); overlayText = "Fill" }
+                                    2 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9); overlayText = "16:9" }
                                 }
                             }) {
                                 Icon(Icons.Rounded.AspectRatio, contentDescription = "Zoom", tint = Color.White)
                             }
                         }
 
-                        // মাঝে প্লে/পজ বাটন
                         IconButton(
                             onClick = {
                                 if (mediaPlayer.isPlaying) mediaPlayer.pause() else mediaPlayer.play()
@@ -379,7 +379,6 @@ fun VlcStylePlayerScreen(
                             )
                         }
 
-                        // ডানে স্ক্রিন রোটেট ও থ্রি-ডট মেনু
                         Row {
                             IconButton(onClick = {
                                 val act = context as ComponentActivity
@@ -399,7 +398,6 @@ fun VlcStylePlayerScreen(
             }
         }
 
-        // ডানপাশের VLC সাইড মেনু (স্ক্রিনশট ৩-এর হুবহু অপশনসমূহ)
         AnimatedVisibility(
             visible = showSideMenu && !isLocked,
             enter = slideInHorizontally(initialOffsetX = { it }),
@@ -418,10 +416,10 @@ fun VlcStylePlayerScreen(
                 SideMenuItem(Icons.Rounded.Bedtime, "Sleep timer") { onSetSleepTimer(30); showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Speed, "Playback speed (${playbackSpeed}x)") {
                     playbackSpeed = if (playbackSpeed >= 2.0f) 0.5f else playbackSpeed + 0.25f
-                    mediaPlayer.rate = playbackSpeed
+                    mediaPlayer.setRate(playbackSpeed)
                 }
                 SideMenuItem(Icons.Rounded.HistoryToggleOff, "Jump to Time (+1m)") {
-                    mediaPlayer.time = (mediaPlayer.time + 60000).coerceAtMost(mediaPlayer.length)
+                    mediaPlayer.setTime((mediaPlayer.time + 60000L).coerceAtMost(mediaPlayer.length))
                 }
                 SideMenuItem(Icons.Rounded.Tune, "Equalizer") { onShowEqualizer(); showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Headphones, "Play as audio") { onPlayAsAudio(); showSideMenu = false }
