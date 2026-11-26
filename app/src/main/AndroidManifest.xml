@@ -4,7 +4,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
@@ -19,11 +19,12 @@
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="true">
 
+        <!-- সাধারণ ব্রাউজিং ও লিস্টে Portrait লক; YouTube ফুলস্ক্রিন হলে কোড থেকে Landscape হবে -->
         <activity
             android:name=".MainActivity"
-            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation|keyboardHidden"
             android:exported="true"
-            android:screenOrientation="fullSensor"
+            android:screenOrientation="portrait"
             android:supportsPictureInPicture="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -31,9 +32,10 @@
             </intent-filter>
         </activity>
 
+        <!-- শুধু ভিডিও চলার সময় সেন্সর অটো-রোটেট কাজ করবে -->
         <activity
             android:name=".VideoPlayerActivity"
-            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation|keyboardHidden"
             android:screenOrientation="fullSensor"
             android:supportsPictureInPicture="true"
             android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" />
@@ -46,6 +48,11 @@
                 <action android:name="androidx.media3.session.MediaSessionService" />
             </intent-filter>
         </service>
+
+        <service
+            android:name=".YouTubeBackgroundService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
 
     </application>
 </manifest>
