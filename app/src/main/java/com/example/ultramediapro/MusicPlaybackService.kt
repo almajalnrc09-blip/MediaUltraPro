@@ -5,6 +5,7 @@ import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
@@ -24,8 +25,8 @@ class MusicPlaybackService : MediaSessionService() {
         val trackSelector = DefaultTrackSelector(this).apply {
             setParameters(
                 buildUponParameters().setAudioOffloadPreferences(
-                    DefaultTrackSelector.AudioOffloadPreferences.Builder()
-                        .setAudioOffloadMode(DefaultTrackSelector.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED)
+                    TrackSelectionParameters.AudioOffloadPreferences.Builder()
+                        .setAudioOffloadMode(TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED)
                         .build()
                 )
             )
