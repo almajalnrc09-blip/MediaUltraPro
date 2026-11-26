@@ -7,6 +7,7 @@ import android.app.PictureInPictureParams
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.util.Rational
@@ -16,7 +17,6 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -43,10 +43,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
-import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
@@ -94,8 +94,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean) {
-        super.onPictureInPictureModeChanged(isInPictureInPictureMode)
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         isPipMode = isInPictureInPictureMode
     }
 }
@@ -192,21 +195,21 @@ fun YouTubeTabScreen() {
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
-            BackgroundWebView(ctx).apply {
-                CookieManager.getInstance().apply {
-                    setAcceptCookie(true)
-                    setAcceptThirdPartyCookies(this@apply, true)
-                }
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    mediaPlaybackRequiresUserGesture = false
-                    cacheMode = WebSettings.LOAD_DEFAULT
-                }
-                webViewClient = WebViewClient()
-                webChromeClient = WebChromeClient()
-                loadUrl("https://m.youtube.com")
+            val webView = BackgroundWebView(ctx)
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieManager.setAcceptThirdPartyCookies(webView, true)
+
+            webView.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                mediaPlaybackRequiresUserGesture = false
+                cacheMode = WebSettings.LOAD_DEFAULT
             }
+            webView.webViewClient = WebViewClient()
+            webView.webChromeClient = WebChromeClient()
+            webView.loadUrl("https://m.youtube.com")
+            webView
         }
     )
 }
@@ -277,7 +280,7 @@ fun MuzioMusicTabScreen() {
     DisposableEffect(Unit) {
         val token = SessionToken(context, ComponentName(context, MusicPlaybackService::class.java))
         val future = MediaController.Builder(context, token).buildAsync()
-        future.addListener({ mediaController = future.get() }, MoreExecutors.directExecutor())
+        future.addListener({ mediaController = future.get() }, ContextCompat.getMainExecutor(context))
         onDispose { mediaController?.release() }
     }
 
@@ -305,7 +308,6 @@ fun MuzioMusicTabScreen() {
             .background(Brush.verticalGradient(listOf(Color(0xFF2B1212), Color(0xFF120B0B))))
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // সার্চ বার ও কাউন্ট (স্ক্রিনশট ৪-এর মতো)
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
@@ -362,7 +364,6 @@ fun MuzioMusicTabScreen() {
             }
         }
 
-        // ভাসমান হলুদ শাফেল বাটন (স্ক্রিনশট ৪ ও ৫-এর মতো)
         FloatingActionButton(
             onClick = {
                 if (songs.isNotEmpty()) {
@@ -385,7 +386,6 @@ fun MuzioMusicTabScreen() {
             Icon(Icons.Rounded.Shuffle, contentDescription = "Shuffle")
         }
 
-        // নিচের মিনি-প্লেয়ার বার (স্ক্রিনশট ৪ ও ৫-এর মতো)
         currentSong?.let { song ->
             Row(
                 modifier = Modifier
@@ -417,7 +417,6 @@ fun MuzioMusicTabScreen() {
             }
         }
 
-        // ফুলস্ক্রিন গোল্ডেন-ব্রাউন প্লেয়ার ও ইকুলাইজার ডায়ালগ (স্ক্রিনশট ৬-এর মতো)
         if (showFullPlayer && currentSong != null) {
             Surface(
                 modifier = Modifier.fillMaxSize(),
@@ -477,9 +476,11 @@ fun MuzioMusicTabScreen() {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(onClick = {
-                            val prevIdx = (songs.indexOf(currentSong) - 1).coerceAtLeast(0)
-                            currentSong = songs[prevIdx]
-                            mediaController?.apply { setMediaItem(MediaItem.fromUri(songs[prevIdx].uri)); prepare(); play() }
+                            if (songs.isNotEmpty()) {
+                                val prevIdx = (songs.indexOf(currentSong) - 1).coerceAtLeast(0)
+                                currentSong = songs[prevIdx]
+                                mediaController?.apply { setMediaItem(MediaItem.fromUri(songs[prevIdx].uri)); prepare(); play() }
+                            }
                         }) {
                             Icon(Icons.Rounded.SkipPrevious, contentDescription = "Prev", tint = Color.White, modifier = Modifier.size(36.dp))
                         }
@@ -499,9 +500,11 @@ fun MuzioMusicTabScreen() {
                         }
 
                         IconButton(onClick = {
-                            val nextIdx = (songs.indexOf(currentSong) + 1) % songs.size
-                            currentSong = songs[nextIdx]
-                            mediaController?.apply { setMediaItem(MediaItem.fromUri(songs[nextIdx].uri)); prepare(); play() }
+                            if (songs.isNotEmpty()) {
+                                val nextIdx = (songs.indexOf(currentSong) + 1) % songs.size
+                                currentSong = songs[nextIdx]
+                                mediaController?.apply { setMediaItem(MediaItem.fromUri(songs[nextIdx].uri)); prepare(); play() }
+                            }
                         }) {
                             Icon(Icons.Rounded.SkipNext, contentDescription = "Next", tint = Color.White, modifier = Modifier.size(36.dp))
                         }
@@ -510,7 +513,6 @@ fun MuzioMusicTabScreen() {
             }
         }
 
-        // ৫-ব্যান্ড হার্ডওয়্যার ইকুলাইজার পপআপ
         if (showEqualizer) {
             AlertDialog(
                 onDismissRequest = { showEqualizer = false },
