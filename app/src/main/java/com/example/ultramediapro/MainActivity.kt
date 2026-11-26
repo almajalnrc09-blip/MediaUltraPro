@@ -510,7 +510,7 @@ fun VideoListTabScreen() {
                     Icon(Icons.Rounded.Movie, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                 },
                 headlineContent = { Text(video.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                supportingContent = { Text("${formatMillis(video.duration)} •${video.sizeMb} MB") },
+                supportingContent = { Text("${formatMillis(video.duration)} • ${video.sizeMb} MB") },
                 trailingContent = {
                     Box {
                         IconButton(onClick = { menuExpanded = true }) {
@@ -779,8 +779,8 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
                             },
                             supportingContent = {
                                 val sub = when (selectedCategory) {
-                                    3 -> "${song.album} •${formatMillis(song.duration)}"
-                                    else -> "${song.artist} •${formatMillis(song.duration)}"
+                                    3 -> "${song.album} • ${formatMillis(song.duration)}"
+                                    else -> "${song.artist} • ${formatMillis(song.duration)}"
                                 }
                                 Text(sub, color = Color.Gray, fontSize = 12.sp, maxLines = 1)
                             },
@@ -797,4 +797,345 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
                                         )
                                         DropdownMenuItem(
                                             text = { Text("Rename") },
-                                            leadingIcon = { Icon(Icons.Rounded.Edit, content
+                                            leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
+                                            onClick = {
+                                                menuExpanded = false
+                                                renameTarget = song
+                                                renameInput = song.title
+                                            }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Delete", color = Color.Red) },
+                                            leadingIcon = { Icon(Icons.Rounded.DeleteOutline, contentDescription = null, tint = Color.Red) },
+                                            onClick = {
+                                                menuExpanded = false
+                                                deleteTarget = song
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        FloatingActionButton(
+            onClick = { if (displayedSongs.isNotEmpty()) playSong(displayedSongs.random()) },
+            containerColor = Color(0xFFFFC107),
+            contentColor = Color.Black,
+            shape = CircleShape,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 20.dp, bottom = if (currentSong != null) 78.dp else 20.dp)
+        ) {
+            Icon(Icons.Rounded.Shuffle, contentDescription = "Shuffle")
+        }
+
+        currentSong?.let { song ->
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color(0xFF261717))
+                    .clickable { showFullPlayer = true }
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Rounded.Album, contentDescription = null, tint = Color(0xFFFFC107), modifier = Modifier.size(34.dp))
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(song.title, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(song.artist, color = Color.LightGray, fontSize = 11.sp, maxLines = 1)
+                }
+                IconButton(onClick = {
+                    if (isPlaying) mediaController?.pause() else mediaController?.play()
+                }) {
+                    Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, contentDescription = "Play", tint = Color.White)
+                }
+                IconButton(onClick = { showEqualizer = true }) {
+                    Icon(Icons.Rounded.Equalizer, contentDescription = "EQ", tint = Color(0xFFFFC107))
+                }
+            }
+        }
+
+        if (showFullPlayer && currentSong != null) {
+            BackHandler { showFullPlayer = false }
+            val song = currentSong!!
+            val isFav = favoriteIds.contains(song.id.toString())
+
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = Color(0xFF7A6348)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .statusBarsPadding()
+                        .navigationBarsPadding()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { showFullPlayer = false }) {
+                            Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "Close", tint = Color.White)
+                        }
+                        Text("Now Playing", color = Color.White, fontWeight = FontWeight.Medium)
+                        IconButton(onClick = { showEqualizer = true }) {
+                            Icon(Icons.Rounded.Equalizer, contentDescription = "Equalizer", tint = Color(0xFFFFC107))
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .size(230.dp)
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color(0xFF4A3B2A)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = Color(0xFFFFC107), modifier = Modifier.size(96.dp))
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = { toggleFavorite(song.id) }) {
+                            Icon(
+                                if (isFav) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+                                contentDescription = "Favorite",
+                                tint = if (isFav) Color(0xFFFF5252) else Color.White
+                            )
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                            Text(song.title, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(song.artist, color = Color.LightGray, fontSize = 13.sp, maxLines = 1)
+                        }
+                        IconButton(onClick = { showQueueDialog = true }) {
+                            Icon(Icons.Rounded.QueueMusic, contentDescription = "Playlist Queue", tint = Color.White)
+                        }
+                    }
+
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Slider(
+                            value = (currentPos.toFloat() / totalDur.toFloat()).coerceIn(0f, 1f),
+                            onValueChange = {
+                                val target = (it * totalDur).toLong()
+                                currentPos = target
+                                mediaController?.seekTo(target)
+                            },
+                            colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = Color.White)
+                        )
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(formatMillis(currentPos), color = Color.White, fontSize = 12.sp)
+                            Text(formatMillis(totalDur), color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = {
+                            repeatMode = when (repeatMode) {
+                                Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ONE
+                                Player.REPEAT_MODE_ONE -> Player.REPEAT_MODE_ALL
+                                else -> Player.REPEAT_MODE_OFF
+                            }
+                            mediaController?.repeatMode = repeatMode
+                        }) {
+                            Icon(
+                                if (repeatMode == Player.REPEAT_MODE_ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
+                                contentDescription = "Repeat",
+                                tint = if (repeatMode != Player.REPEAT_MODE_OFF) Color(0xFFFFC107) else Color.White
+                            )
+                        }
+
+                        IconButton(onClick = {
+                            if (displayedSongs.isNotEmpty()) {
+                                val idx = displayedSongs.indexOfFirst { it.id == song.id }
+                                val prev = if (idx > 0) displayedSongs[idx - 1] else displayedSongs.last()
+                                playSong(prev)
+                            }
+                        }) {
+                            Icon(Icons.Rounded.SkipPrevious, contentDescription = "Prev", tint = Color.White, modifier = Modifier.size(34.dp))
+                        }
+
+                        IconButton(
+                            onClick = { if (isPlaying) mediaController?.pause() else mediaController?.play() },
+                            modifier = Modifier.size(64.dp).background(Color(0x44FFFFFF), CircleShape)
+                        ) {
+                            Icon(
+                                if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                contentDescription = "Play/Pause",
+                                tint = Color.White,
+                                modifier = Modifier.size(38.dp)
+                            )
+                        }
+
+                        IconButton(onClick = {
+                            if (displayedSongs.isNotEmpty()) {
+                                val next = if (shuffleEnabled) displayedSongs.random() else {
+                                    val idx = displayedSongs.indexOfFirst { it.id == song.id }
+                                    displayedSongs[(idx + 1) % displayedSongs.size]
+                                }
+                                playSong(next)
+                            }
+                        }) {
+                            Icon(Icons.Rounded.SkipNext, contentDescription = "Next", tint = Color.White, modifier = Modifier.size(34.dp))
+                        }
+
+                        IconButton(onClick = { shuffleEnabled = !shuffleEnabled }) {
+                            Icon(
+                                Icons.Rounded.Shuffle,
+                                contentDescription = "Shuffle",
+                                tint = if (shuffleEnabled) Color(0xFFFFC107) else Color.White
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (showQueueDialog) {
+            AlertDialog(
+                onDismissRequest = { showQueueDialog = false },
+                title = { Text("Playing Queue (${displayedSongs.size})") },
+                text = {
+                    LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
+                        items(displayedSongs, key = { it.id }) { s ->
+                            Text(
+                                text = s.title,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                fontWeight = if (s.id == currentSong?.id) FontWeight.Bold else FontWeight.Normal,
+                                color = if (s.id == currentSong?.id) Color(0xFFFFC107) else MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        playSong(s)
+                                        showQueueDialog = false
+                                    }
+                                    .padding(vertical = 10.dp)
+                            )
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showQueueDialog = false }) { Text("Close") } }
+            )
+        }
+
+        if (showEqualizer) {
+            AlertDialog(
+                onDismissRequest = { showEqualizer = false },
+                title = { Text("Equalizer & Bass Boost") },
+                text = {
+                    val eq = MusicPlaybackService.equalizer
+                    val bass = MusicPlaybackService.bassBoost
+                    if (eq == null) {
+                        Text("ইকুলাইজার সক্রিয় করতে আগে যেকোনো একটি গান চালু করুন।")
+                    } else {
+                        Column(modifier = Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState())) {
+                            val presetCount = eq.numberOfPresets.toInt().coerceAtMost(5)
+                            if (presetCount > 0) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    for (p in 0 until presetCount) {
+                                        val name = eq.getPresetName(p.toShort())
+                                        AssistChip(
+                                            onClick = {
+                                                eq.usePreset(p.toShort())
+                                                Toast.makeText(context, "Preset: $name", Toast.LENGTH_SHORT).show()
+                                            },
+                                            label = { Text(name, fontSize = 10.sp) }
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
+                            if (bass != null && bass.strengthSupported) {
+                                var bassStrength by remember { mutableFloatStateOf(bass.roundedStrength.toFloat()) }
+                                Text("Bass Boost (${(bassStrength / 10).toInt()}%)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Slider(
+                                    value = bassStrength,
+                                    valueRange = 0f..1000f,
+                                    onValueChange = {
+                                        bassStrength = it
+                                        bass.setStrength(it.toInt().toShort())
+                                    }
+                                )
+                            }
+
+                            val bands = eq.numberOfBands.toInt()
+                            val range = eq.bandLevelRange
+                            for (i in 0 until bands) {
+                                var level by remember { mutableFloatStateOf(eq.getBandLevel(i.toShort()).toFloat()) }
+                                Text("${eq.getCenterFreq(i.toShort()) / 1000} Hz", fontSize = 12.sp)
+                                Slider(
+                                    value = level,
+                                    valueRange = range[0].toFloat()..range[1].toFloat(),
+                                    onValueChange = {
+                                        level = it
+                                        eq.setBandLevel(i.toShort(), it.toInt().toShort())
+                                    }
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showEqualizer = false }) { Text("Done") } }
+            )
+        }
+
+        deleteTarget?.let { target ->
+            AlertDialog(
+                onDismissRequest = { deleteTarget = null },
+                title = { Text("অডিও ডিলিট করবেন?") },
+                text = { Text("আপনি কি নিশ্চিতভাবে \"${target.title}\" ফাইলটি স্থায়ীভাবে মুছে ফেলতে চান?") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        deleteTarget = null
+                        MediaScanner.deleteFile(activity, target.uri, deleteLauncher) { refreshKey++ }
+                    }) { Text("Delete", color = Color.Red) }
+                },
+                dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } }
+            )
+        }
+
+        renameTarget?.let { target ->
+            AlertDialog(
+                onDismissRequest = { renameTarget = null },
+                title = { Text("Rename Audio") },
+                text = {
+                    OutlinedTextField(
+                        value = renameInput,
+                        onValueChange = { renameInput = it },
+                        singleLine = true,
+                        label = { Text("নতুন নাম") }
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val newName = renameInput.trim()
+                        renameTarget = null
+                        if (newName.isNotEmpty()) {
+                            pendingRenameAfterPerm = target to newName
+                            MediaScanner.renameFile(activity, target.uri, newName, writeLauncher) {
+                                pendingRenameAfterPerm = null
+                                refreshKey++
+                            }
+                        }
+                    }) { Text("Save") }
+                },
+                dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
+            )
+        }
+    }
+}
