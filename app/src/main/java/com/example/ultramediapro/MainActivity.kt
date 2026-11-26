@@ -5,12 +5,14 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.PictureInPictureParams
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.util.Rational
 import android.view.View
 import android.view.ViewGroup
@@ -140,7 +142,6 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         if (selectedTab == 0) {
-            // ব্যাকগ্রাউন্ড ও স্ক্রিন লকে YouTube চালু রাখতে WebView ও সার্ভিস সক্রিয় রাখা
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
             try {
@@ -157,7 +158,6 @@ class MainActivity : ComponentActivity() {
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         if (selectedTab == 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // PiP মোডে শুধুমাত্র ভিডিওটি পুরো বক্সে ফিট করে প্লে চালু রাখা
             activeWebView?.evaluateJavascript(
                 """
                 (function() {
@@ -241,7 +241,6 @@ fun MainAppContainer(
         permissionLauncher.launch(perms.toTypedArray())
     }
 
-    // YouTube ফুলস্ক্রিন ভিউ চালু থাকলে পুরো স্ক্রিনে দেখাবে
     if (fullscreenView != null) {
         BackHandler { onHideFullscreen() }
         AndroidView(
@@ -262,7 +261,6 @@ fun MainAppContainer(
         return
     }
 
-    // YouTube ব্যাক বাটন হ্যান্ডলার (অ্যাপ ক্লোজ না হয়ে আগের পেজে/Shorts থেকে বের হবে)
     BackHandler(enabled = selectedTab == 0) {
         val wv = activity.activeWebView
         if (wv != null && wv.canGoBack()) {
@@ -295,7 +293,6 @@ fun MainAppContainer(
             }
         },
         bottomBar = {
-            // আল্ট্রা-কমপ্যাক্ট, স্লিম, আইকন-অনলি বটম বার (জায়গা নষ্ট করবে না)
             if (!isPipMode && !isMusicFullPlayerOpen) {
                 Surface(
                     tonalElevation = 3.dp,
@@ -331,7 +328,6 @@ fun MainAppContainer(
         }
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize()) {
-            // YouTube WebView মেমোরিতে ধরে রাখা যাতে ট্যাব বদলালেও রিলোড না হয়
             Box(modifier = if (selectedTab == 0) Modifier.fillMaxSize() else Modifier.size(0.dp)) {
                 YouTubeTabScreen(
                     activity = activity,
@@ -372,7 +368,6 @@ fun CompactTabIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, select
 
 class BackgroundWebView(context: Context) : WebView(context) {
     override fun onWindowVisibilityChanged(visibility: Int) {
-        // স্ক্রিন লক বা মিনিমাইজ হলে সর্বদা VISIBLE রিপোর্ট করবে
         super.onWindowVisibilityChanged(View.VISIBLE)
     }
 }
@@ -426,7 +421,6 @@ fun YouTubeTabScreen(
             webView.webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                     val url = request?.url?.toString() ?: return false
-                    // intent:// বা অ্যাপ খোলার লিংক ব্লক করা যাতে ERR_UNKNOWN_URL_SCHEME না আসে
                     if (!url.startsWith("http://") && !url.startsWith("https://")) {
                         return true
                     }
@@ -483,7 +477,12 @@ fun VideoListTabScreen() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             pendingRenameAfterPerm?.let { (file, name) ->
-                MediaScanner.renameFile(activity, file.uri, name, writeLauncher) { refreshKey++ }
+                try {
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                    }
+                    activity.contentResolver.update(file.uri, values, null, null)
+                } catch (_: Exception) { }
             }
             refreshKey++
         }
@@ -511,7 +510,7 @@ fun VideoListTabScreen() {
                     Icon(Icons.Rounded.Movie, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                 },
                 headlineContent = { Text(video.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                supportingContent = { Text("${formatMillis(video.duration)} • ${video.sizeMb} MB") },
+                supportingContent = { Text("${formatMillis(video.duration)} •${video.sizeMb} MB") },
                 trailingContent = {
                     Box {
                         IconButton(onClick = { menuExpanded = true }) {
@@ -543,7 +542,6 @@ fun VideoListTabScreen() {
         }
     }
 
-    // ডাবল কনফার্মেশন ডিলিট ডায়ালগ
     deleteTarget?.let { target ->
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
@@ -561,7 +559,6 @@ fun VideoListTabScreen() {
         )
     }
 
-    // রিনেম ডায়ালগ
     renameTarget?.let { target ->
         AlertDialog(
             onDismissRequest = { renameTarget = null },
@@ -602,7 +599,7 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
 
     var songs by remember { mutableStateOf<List<MediaFile>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
-    var selectedCategory by remember { mutableIntStateOf(0) } // 0=Songs, 1=Favorites, 2=Artists, 3=Albums
+    var selectedCategory by remember { mutableIntStateOf(0) }
     var refreshKey by remember { mutableIntStateOf(0) }
     var favoriteIds by remember {
         mutableStateOf(prefs.getStringSet("fav_ids", emptySet())?.toSet() ?: emptySet())
@@ -637,7 +634,12 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             pendingRenameAfterPerm?.let { (file, name) ->
-                MediaScanner.renameFile(activity, file.uri, name, writeLauncher) { refreshKey++ }
+                try {
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                    }
+                    activity.contentResolver.update(file.uri, values, null, null)
+                } catch (_: Exception) { }
             }
             refreshKey++
         }
@@ -704,7 +706,6 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
             .background(Brush.verticalGradient(listOf(Color(0xFF2B1212), Color(0xFF120B0B))))
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Muzio ক্যাটাগরি ট্যাব: Songs | Favorites | Artists | Albums
             val tabs = listOf("Songs", "Favorites", "Artists", "Albums")
             TabRow(
                 selectedTabIndex = selectedCategory,
@@ -778,8 +779,8 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
                             },
                             supportingContent = {
                                 val sub = when (selectedCategory) {
-                                    3 -> "${song.album} • ${formatMillis(song.duration)}"
-                                    else -> "${song.artist} • ${formatMillis(song.duration)}"
+                                    3 -> "${song.album} •${formatMillis(song.duration)}"
+                                    else -> "${song.artist} •${formatMillis(song.duration)}"
                                 }
                                 Text(sub, color = Color.Gray, fontSize = 12.sp, maxLines = 1)
                             },
@@ -796,357 +797,4 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
                                         )
                                         DropdownMenuItem(
                                             text = { Text("Rename") },
-                                            leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
-                                            onClick = {
-                                                menuExpanded = false
-                                                renameTarget = song
-                                                renameInput = song.title
-                                            }
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("Delete", color = Color.Red) },
-                                            leadingIcon = { Icon(Icons.Rounded.DeleteOutline, contentDescription = null, tint = Color.Red) },
-                                            onClick = {
-                                                menuExpanded = false
-                                                deleteTarget = song
-                                            }
-                                        )
-                                    }
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-        }
-
-        // ভাসমান শাফেল বাটন
-        FloatingActionButton(
-            onClick = { if (displayedSongs.isNotEmpty()) playSong(displayedSongs.random()) },
-            containerColor = Color(0xFFFFC107),
-            contentColor = Color.Black,
-            shape = CircleShape,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 20.dp, bottom = if (currentSong != null) 78.dp else 20.dp)
-        ) {
-            Icon(Icons.Rounded.Shuffle, contentDescription = "Shuffle")
-        }
-
-        // মিনি-প্লেয়ার বার
-        currentSong?.let { song ->
-            Row(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .background(Color(0xFF261717))
-                    .clickable { showFullPlayer = true }
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(Icons.Rounded.Album, contentDescription = null, tint = Color(0xFFFFC107), modifier = Modifier.size(34.dp))
-                Spacer(modifier = Modifier.width(10.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(song.title, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                    Text(song.artist, color = Color.LightGray, fontSize = 11.sp, maxLines = 1)
-                }
-                IconButton(onClick = {
-                    if (isPlaying) mediaController?.pause() else mediaController?.play()
-                }) {
-                    Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, contentDescription = "Play", tint = Color.White)
-                }
-                IconButton(onClick = { showEqualizer = true }) {
-                    Icon(Icons.Rounded.Equalizer, contentDescription = "EQ", tint = Color(0xFFFFC107))
-                }
-            }
-        }
-
-        // ফুলস্ক্রিন গোল্ডেন-ব্রাউন প্লেয়ার (Seekbar, Repeat, Shuffle, Queue ও Equalizer-সহ)
-        if (showFullPlayer && currentSong != null) {
-            BackHandler { showFullPlayer = false }
-            val song = currentSong!!
-            val isFav = favoriteIds.contains(song.id.toString())
-
-            Surface(
-                modifier = Modifier.fillMaxSize(),
-                color = Color(0xFF7A6348)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .statusBarsPadding()
-                        .navigationBarsPadding()
-                        .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { showFullPlayer = false }) {
-                            Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "Close", tint = Color.White)
-                        }
-                        Text("Now Playing", color = Color.White, fontWeight = FontWeight.Medium)
-                        IconButton(onClick = { showEqualizer = true }) {
-                            Icon(Icons.Rounded.Equalizer, contentDescription = "Equalizer", tint = Color(0xFFFFC107))
-                        }
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .size(230.dp)
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color(0xFF4A3B2A)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = Color(0xFFFFC107), modifier = Modifier.size(96.dp))
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(onClick = { toggleFavorite(song.id) }) {
-                            Icon(
-                                if (isFav) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                                contentDescription = "Favorite",
-                                tint = if (isFav) Color(0xFFFF5252) else Color.White
-                            )
-                        }
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
-                            Text(song.title, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(song.artist, color = Color.LightGray, fontSize = 13.sp, maxLines = 1)
-                        }
-                        IconButton(onClick = { showQueueDialog = true }) {
-                            Icon(Icons.Rounded.QueueMusic, contentDescription = "Playlist Queue", tint = Color.White)
-                        }
-                    }
-
-                    // লাইভ সিকবার ও সময়
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Slider(
-                            value = (currentPos.toFloat() / totalDur.toFloat()).coerceIn(0f, 1f),
-                            onValueChange = {
-                                val target = (it * totalDur).toLong()
-                                currentPos = target
-                                mediaController?.seekTo(target)
-                            },
-                            colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = Color.White)
-                        )
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(formatMillis(currentPos), color = Color.White, fontSize = 12.sp)
-                            Text(formatMillis(totalDur), color = Color.White, fontSize = 12.sp)
-                        }
-                    }
-
-                    // কন্ট্রোল রো (Repeat, Prev, Play/Pause, Next, Shuffle)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(onClick = {
-                            repeatMode = when (repeatMode) {
-                                Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ONE
-                                Player.REPEAT_MODE_ONE -> Player.REPEAT_MODE_ALL
-                                else -> Player.REPEAT_MODE_OFF
-                            }
-                            mediaController?.repeatMode = repeatMode
-                        }) {
-                            Icon(
-                                if (repeatMode == Player.REPEAT_MODE_ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
-                                contentDescription = "Repeat",
-                                tint = if (repeatMode != Player.REPEAT_MODE_OFF) Color(0xFFFFC107) else Color.White
-                            )
-                        }
-
-                        IconButton(onClick = {
-                            if (displayedSongs.isNotEmpty()) {
-                                val idx = displayedSongs.indexOfFirst { it.id == song.id }
-                                val prev = if (idx > 0) displayedSongs[idx - 1] else displayedSongs.last()
-                                playSong(prev)
-                            }
-                        }) {
-                            Icon(Icons.Rounded.SkipPrevious, contentDescription = "Prev", tint = Color.White, modifier = Modifier.size(34.dp))
-                        }
-
-                        IconButton(
-                            onClick = { if (isPlaying) mediaController?.pause() else mediaController?.play() },
-                            modifier = Modifier.size(64.dp).background(Color(0x44FFFFFF), CircleShape)
-                        ) {
-                            Icon(
-                                if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                contentDescription = "Play/Pause",
-                                tint = Color.White,
-                                modifier = Modifier.size(38.dp)
-                            )
-                        }
-
-                        IconButton(onClick = {
-                            if (displayedSongs.isNotEmpty()) {
-                                val next = if (shuffleEnabled) displayedSongs.random() else {
-                                    val idx = displayedSongs.indexOfFirst { it.id == song.id }
-                                    displayedSongs[(idx + 1) % displayedSongs.size]
-                                }
-                                playSong(next)
-                            }
-                        }) {
-                            Icon(Icons.Rounded.SkipNext, contentDescription = "Next", tint = Color.White, modifier = Modifier.size(34.dp))
-                        }
-
-                        IconButton(onClick = { shuffleEnabled = !shuffleEnabled }) {
-                            Icon(
-                                Icons.Rounded.Shuffle,
-                                contentDescription = "Shuffle",
-                                tint = if (shuffleEnabled) Color(0xFFFFC107) else Color.White
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        // Queue / Up Next লিস্ট ডায়ালগ
-        if (showQueueDialog) {
-            AlertDialog(
-                onDismissRequest = { showQueueDialog = false },
-                title = { Text("Playing Queue (${displayedSongs.size})") },
-                text = {
-                    LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
-                        items(displayedSongs, key = { it.id }) { s ->
-                            Text(
-                                text = s.title,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = if (s.id == currentSong?.id) FontWeight.Bold else FontWeight.Normal,
-                                color = if (s.id == currentSong?.id) Color(0xFFFFC107) else MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        playSong(s)
-                                        showQueueDialog = false
-                                    }
-                                    .padding(vertical = 10.dp)
-                            )
-                        }
-                    }
-                },
-                confirmButton = { TextButton(onClick = { showQueueDialog = false }) { Text("Close") } }
-            )
-        }
-
-        // আসল ৫-ব্যান্ড হার্ডওয়্যার ইকুলাইজার + Bass Boost ডায়ালগ
-        if (showEqualizer) {
-            AlertDialog(
-                onDismissRequest = { showEqualizer = false },
-                title = { Text("Equalizer & Bass Boost") },
-                text = {
-                    val eq = MusicPlaybackService.equalizer
-                    val bass = MusicPlaybackService.bassBoost
-                    if (eq == null) {
-                        Text("ইকুলাইজার সক্রিয় করতে আগে যেকোনো একটি গান চালু করুন।")
-                    } else {
-                        Column(modifier = Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState())) {
-                            // প্রিসেট বাটনসমূহ
-                            val presetCount = eq.numberOfPresets.toInt().coerceAtMost(5)
-                            if (presetCount > 0) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    for (p in 0 until presetCount) {
-                                        val name = eq.getPresetName(p.toShort())
-                                        AssistChip(
-                                            onClick = {
-                                                eq.usePreset(p.toShort())
-                                                Toast.makeText(context, "Preset: $name", Toast.LENGTH_SHORT).show()
-                                            },
-                                            label = { Text(name, fontSize = 10.sp) }
-                                        )
-                                    }
-                                }
-                                Spacer(modifier = Modifier.height(8.dp))
-                            }
-
-                            // Bass Boost স্লাইডার
-                            if (bass != null && bass.strengthSupported) {
-                                var bassStrength by remember { mutableFloatStateOf(bass.roundedStrength.toFloat()) }
-                                Text("Bass Boost (${(bassStrength / 10).toInt()}%)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                                Slider(
-                                    value = bassStrength,
-                                    valueRange = 0f..1000f,
-                                    onValueChange = {
-                                        bassStrength = it
-                                        bass.setStrength(it.toInt().toShort())
-                                    }
-                                )
-                            }
-
-                            // ৫-ব্যান্ড ফ্রিকোয়েন্সি স্লাইডার
-                            val bands = eq.numberOfBands.toInt()
-                            val range = eq.bandLevelRange
-                            for (i in 0 until bands) {
-                                var level by remember { mutableFloatStateOf(eq.getBandLevel(i.toShort()).toFloat()) }
-                                Text("${eq.getCenterFreq(i.toShort()) / 1000} Hz", fontSize = 12.sp)
-                                Slider(
-                                    value = level,
-                                    valueRange = range[0].toFloat()..range[1].toFloat(),
-                                    onValueChange = {
-                                        level = it
-                                        eq.setBandLevel(i.toShort(), it.toInt().toShort())
-                                    }
-                                )
-                            }
-                        }
-                    }
-                },
-                confirmButton = { TextButton(onClick = { showEqualizer = false }) { Text("Done") } }
-            )
-        }
-
-        // ডাবল কনফার্মেশন ডিলিট ডায়ালগ
-        deleteTarget?.let { target ->
-            AlertDialog(
-                onDismissRequest = { deleteTarget = null },
-                title = { Text("অডিও ডিলিট করবেন?") },
-                text = { Text("আপনি কি নিশ্চিতভাবে \"${target.title}\" ফাইলটি স্থায়ীভাবে মুছে ফেলতে চান?") },
-                confirmButton = {
-                    TextButton(onClick = {
-                        deleteTarget = null
-                        MediaScanner.deleteFile(activity, target.uri, deleteLauncher) { refreshKey++ }
-                    }) { Text("Delete", color = Color.Red) }
-                },
-                dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } }
-            )
-        }
-
-        // রিনেম ডায়ালগ
-        renameTarget?.let { target ->
-            AlertDialog(
-                onDismissRequest = { renameTarget = null },
-                title = { Text("Rename Audio") },
-                text = {
-                    OutlinedTextField(
-                        value = renameInput,
-                        onValueChange = { renameInput = it },
-                        singleLine = true,
-                        label = { Text("নতুন নাম") }
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        val newName = renameInput.trim()
-                        renameTarget = null
-                        if (newName.isNotEmpty()) {
-                            pendingRenameAfterPerm = target to newName
-                            MediaScanner.renameFile(activity, target.uri, newName, writeLauncher) {
-                                pendingRenameAfterPerm = null
-                                refreshKey++
-                            }
-                        }
-                    }) { Text("Save") }
-                },
-                dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
-            )
-        }
-    }
-}
+                                            leadingIcon = { Icon(Icons.Rounded.Edit, content
