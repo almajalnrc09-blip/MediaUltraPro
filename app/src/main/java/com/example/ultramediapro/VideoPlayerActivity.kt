@@ -13,9 +13,7 @@ import android.util.Rational
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -54,8 +52,6 @@ import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
-import java.io.File
-import java.io.FileOutputStream
 import kotlin.math.abs
 
 class VideoPlayerActivity : ComponentActivity() {
@@ -66,8 +62,6 @@ class VideoPlayerActivity : ComponentActivity() {
     private var sleepTimer: CountDownTimer? = null
     private var isBackgroundAudioMode = false
     private var isPipMode by mutableStateOf(false)
-
-    private val resumeKeyPrefix = "resume_pos_"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -98,31 +92,13 @@ class VideoPlayerActivity : ComponentActivity() {
         mediaPlayer.setMedia(media)
         media.release()
 
-        val prefs = getSharedPreferences("video_resume_prefs", MODE_PRIVATE)
-        val savedPos = prefs.getLong(resumeKeyPrefix + videoUriString.hashCode(), 0L)
-
         setContent {
-            val srtLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.OpenDocument()
-            ) { srtUri: Uri? ->
-                if (srtUri != null) {
-                    attachExternalSubtitle(srtUri)
-                }
-            }
-
             MaterialTheme(colorScheme = darkColorScheme()) {
                 VlcStylePlayerScreen(
                     mediaPlayer = mediaPlayer,
                     videoTitle = videoTitle,
-                    savedResumePos = savedPos,
                     isPipMode = isPipMode,
-                    onBack = {
-                        saveResumePosition(videoUriString)
-                        finish()
-                    },
-                    onPickSubtitle = {
-                        srtLauncher.launch(arrayOf("*/*"))
-                    },
+                    onBack = { finish() },
                     onEnterPip = {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                             try {
@@ -150,7 +126,6 @@ class VideoPlayerActivity : ComponentActivity() {
                             sleepTimer = object : CountDownTimer(minutes * 60 * 1000L, 1000) {
                                 override fun onTick(millisUntilFinished: Long) {}
                                 override fun onFinish() {
-                                    saveResumePosition(videoUriString)
                                     mediaPlayer.pause()
                                     finish()
                                 }
@@ -162,39 +137,6 @@ class VideoPlayerActivity : ComponentActivity() {
                 )
             }
         }
-    }
-
-    private fun attachExternalSubtitle(srtUri: Uri) {
-        try {
-            val subFile = File(cacheDir, "external_sub_${System.currentTimeMillis()}.srt")
-            contentResolver.openInputStream(srtUri)?.use { input ->
-                FileOutputStream(subFile).use { output ->
-                    input.copyTo(output)
-                }
-            }
-            val added = mediaPlayer.addSlave(Media.Slave.Type.Subtitle, Uri.fromFile(subFile), true)
-            if (added) {
-                Toast.makeText(this, "সাবটাইটেল (.srt) যুক্ত হয়েছে", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "সাবটাইটেল যুক্ত করা যায়নি", Toast.LENGTH_SHORT).show()
-            }
-        } catch (_: Exception) {
-            Toast.makeText(this, "সাবটাইটেল ফাইল পড়া যায়নি", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun saveResumePosition(videoUriString: String) {
-        try {
-            val pos = mediaPlayer.time
-            val len = mediaPlayer.length
-            val prefs = getSharedPreferences("video_resume_prefs", MODE_PRIVATE)
-            val key = resumeKeyPrefix + videoUriString.hashCode()
-            if (pos > 5000L && (len <= 0L || pos < len - 5000L)) {
-                prefs.edit().putLong(key, pos).apply()
-            } else {
-                prefs.edit().remove(key).apply()
-            }
-        } catch (_: Exception) { }
     }
 
     override fun onPictureInPictureModeChanged(
@@ -224,20 +166,12 @@ class VideoPlayerActivity : ComponentActivity() {
         val actions = mutableListOf<() -> Unit>()
 
         audioTracks.forEach { track ->
-            val mark = if (track.id == mediaPlayer.audioTrack) " ✓" else ""
-            items.add("Audio: ${track.name}$mark")
-            actions.add {
-                mediaPlayer.setAudioTrack(track.id)
-                Toast.makeText(this, "Audio: ${track.name}", Toast.LENGTH_SHORT).show()
-            }
+            items.add("Audio: ${track.name}")
+            actions.add { mediaPlayer.setAudioTrack(track.id) }
         }
         subTracks.forEach { track ->
-            val mark = if (track.id == mediaPlayer.spuTrack) " ✓" else ""
-            items.add("Subtitle: ${track.name}$mark")
-            actions.add {
-                mediaPlayer.setSpuTrack(track.id)
-                Toast.makeText(this, "Subtitle: ${track.name}", Toast.LENGTH_SHORT).show()
-            }
+            items.add("Subtitle: ${track.name}")
+            actions.add { mediaPlayer.setSpuTrack(track.id) }
         }
 
         if (items.isEmpty()) {
@@ -246,15 +180,13 @@ class VideoPlayerActivity : ComponentActivity() {
         }
 
         AlertDialog.Builder(this)
-            .setTitle("Audio & Subtitle Quick Switch")
+            .setTitle("Audio & Subtitle Tracks")
             .setItems(items.toTypedArray()) { _, which -> actions[which].invoke() }
             .show()
     }
 
     override fun onStop() {
         super.onStop()
-        val uriStr = intent.getStringExtra("VIDEO_URI")
-        if (uriStr != null) saveResumePosition(uriStr)
         if (!isBackgroundAudioMode && !isInPictureInPictureMode) {
             mediaPlayer.pause()
         }
@@ -277,10 +209,8 @@ class VideoPlayerActivity : ComponentActivity() {
 fun VlcStylePlayerScreen(
     mediaPlayer: MediaPlayer,
     videoTitle: String,
-    savedResumePos: Long,
     isPipMode: Boolean,
     onBack: () -> Unit,
-    onPickSubtitle: () -> Unit,
     onEnterPip: () -> Unit,
     onPlayAsAudio: () -> Unit,
     onSetSleepTimer: (Int) -> Unit,
@@ -298,7 +228,6 @@ fun VlcStylePlayerScreen(
     var overlayText by remember { mutableStateOf("") }
     var zoomMode by remember { mutableIntStateOf(0) }
     var currentVolume by remember { mutableIntStateOf(mediaPlayer.volume.coerceIn(0, 100)) }
-    var resumeApplied by remember { mutableStateOf(false) }
 
     val speedSteps = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     var speedIdx by remember { mutableIntStateOf(2) }
@@ -330,11 +259,6 @@ fun VlcStylePlayerScreen(
             val len = mediaPlayer.length
             if (t >= 0) currentTime = t
             if (len > 0) totalDuration = len
-            if (!resumeApplied && savedResumePos > 5000L && len > savedResumePos + 3000L) {
-                resumeApplied = true
-                mediaPlayer.setTime(savedResumePos)
-                overlayText = "Resumed ${formatMillis(savedResumePos)}"
-            }
             delay(400)
         }
     }
@@ -386,6 +310,7 @@ fun VlcStylePlayerScreen(
                 }
             }
     ) {
+        // ভিডিও ভিউ স্ক্রিনের ঠিক মাঝখানে সঠিক অনুপাতে ফিট থাকবে
         AndroidView(
             modifier = Modifier
                 .fillMaxSize()
@@ -401,7 +326,7 @@ fun VlcStylePlayerScreen(
 
         if (overlayText.isNotEmpty() && !isPipMode) {
             LaunchedEffect(overlayText) {
-                delay(1400)
+                delay(1200)
                 overlayText = ""
             }
             Box(
@@ -429,6 +354,7 @@ fun VlcStylePlayerScreen(
 
         AnimatedVisibility(visible = showControls && !isLocked && !isPipMode, enter = fadeIn(), exit = fadeOut()) {
             Box(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
+                // চিকন ও কার্ভড টপ বার
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -452,6 +378,7 @@ fun VlcStylePlayerScreen(
                     )
                 }
 
+                // চিকন ও কার্ভড বটম কন্ট্রোল বক্স
                 Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -495,18 +422,9 @@ fun VlcStylePlayerScreen(
                             IconButton(onClick = {
                                 zoomMode = (zoomMode + 1) % 3
                                 when (zoomMode) {
-                                    0 -> {
-                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT)
-                                        overlayText = "Best Fit"
-                                    }
-                                    1 -> {
-                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN)
-                                        overlayText = "Fit Screen"
-                                    }
-                                    2 -> {
-                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9)
-                                        overlayText = "16:9"
-                                    }
+                                    0 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT); overlayText = "Best Fit" }
+                                    1 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN); overlayText = "Fit Screen" }
+                                    2 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9); overlayText = "16:9" }
                                 }
                             }, modifier = Modifier.size(34.dp)) {
                                 Icon(Icons.Rounded.AspectRatio, contentDescription = "Zoom", tint = Color.White, modifier = Modifier.size(19.dp))
@@ -556,6 +474,7 @@ fun VlcStylePlayerScreen(
             }
         }
 
+        // কার্ভড সাইড মেনু (ইকুলাইজার ছাড়া পরিচ্ছন্ন অপশনসমূহ)
         AnimatedVisibility(
             visible = showSideMenu && !isLocked && !isPipMode,
             enter = slideInHorizontally(initialOffsetX = { it }),
@@ -567,7 +486,7 @@ fun VlcStylePlayerScreen(
         ) {
             Column(
                 modifier = Modifier
-                    .width(245.dp)
+                    .width(240.dp)
                     .fillMaxHeight()
                     .clip(RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp))
                     .background(Color(0xEE1E1A17))
@@ -623,7 +542,6 @@ fun VlcStylePlayerScreen(
                     }
                 }
 
-                SideMenuItem(Icons.Rounded.ClosedCaption, "Load .srt subtitle") { showSideMenu = false; onPickSubtitle() }
                 SideMenuItem(Icons.Rounded.HistoryToggleOff, "Jump to Time") { showJumpDialog = true; showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Headphones, "Play as audio") { onPlayAsAudio(); showSideMenu = false }
                 SideMenuItem(Icons.Rounded.PictureInPictureAlt, "Pop-Up player") { showSideMenu = false; onEnterPip() }
