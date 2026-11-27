@@ -34,6 +34,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
@@ -65,7 +66,6 @@ class VideoPlayerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        // উল্টে যাওয়া বা অতিরিক্ত ঘোরা বন্ধ করতে স্বাভাবিক SENSOR মোড
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
         hideSystemBars()
 
@@ -227,11 +227,11 @@ fun VlcStylePlayerScreen(
     var currentTime by remember { mutableLongStateOf(0L) }
     var totalDuration by remember { mutableLongStateOf(1L) }
     var overlayText by remember { mutableStateOf("") }
-    var zoomMode by remember { mutableIntStateOf(0) }
-    var currentVolume by remember { mutableIntStateOf(100) }
+    var zoomMode by remember { mutableIntStateOf(0) } // 0=Best Fit, 1=Fit Screen, 2=16:9
+    var currentVolume by remember { mutableIntStateOf(mediaPlayer.volume.coerceIn(0, 100)) }
 
     val speedSteps = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
-    var speedIdx by remember { mutableIntStateOf(2) } // 1.0x Normal
+    var speedIdx by remember { mutableIntStateOf(2) }
     val currentSpeed = speedSteps[speedIdx]
     val speedLabel = when {
         currentSpeed == 1.0f -> "1.0x"
@@ -306,7 +306,7 @@ fun VlcStylePlayerScreen(
                             activity.window.attributes = lp
                             overlayText = "Brightness: ${(next * 100).toInt()}%"
                         } else {
-                            currentVolume = (currentVolume + delta.toInt()).coerceIn(0, 200)
+                            currentVolume = (currentVolume + delta.toInt()).coerceIn(0, 100)
                             mediaPlayer.setVolume(currentVolume)
                             overlayText = "Volume: $currentVolume%"
                         }
@@ -319,6 +319,7 @@ fun VlcStylePlayerScreen(
             factory = { ctx ->
                 VLCVideoLayout(ctx).apply {
                     mediaPlayer.attachViews(this, null, false, false)
+                    mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT)
                     post { mediaPlayer.play() }
                 }
             }
@@ -345,7 +346,7 @@ fun VlcStylePlayerScreen(
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .safeDrawingPadding()
-                    .padding(16.dp)
+                    .padding(14.dp)
                     .background(Color(0x88000000), CircleShape)
             ) {
                 Icon(Icons.Rounded.Lock, contentDescription = "Unlock", tint = Color(0xFFFF8800))
@@ -354,39 +355,46 @@ fun VlcStylePlayerScreen(
 
         AnimatedVisibility(visible = showControls && !isLocked && !isPipMode, enter = fadeIn(), exit = fadeOut()) {
             Box(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
+                // স্লিম ও কার্ভড টপ বার
                 Row(
                     modifier = Modifier
+                        .align(Alignment.TopCenter)
                         .fillMaxWidth()
-                        .background(Color(0x66000000))
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color(0x88141414))
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Rounded.ArrowBack, contentDescription = "Back", tint = Color.White)
+                    IconButton(onClick = onBack, modifier = Modifier.size(38.dp)) {
+                        Icon(Icons.Rounded.ArrowBack, contentDescription = "Back", tint = Color.White, modifier = Modifier.size(20.dp))
                     }
                     Text(
                         text = videoTitle,
                         color = Color.White,
-                        fontSize = 15.sp,
+                        fontSize = 14.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f).padding(horizontal = 6.dp)
                     )
                 }
 
+                // স্লিম ও কার্ভড বটম কন্ট্রোল বক্স
                 Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .background(Color(0x99000000))
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color(0xAA141414))
+                        .padding(horizontal = 14.dp, vertical = 6.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(formatMillis(currentTime), color = Color.White, fontSize = 12.sp)
-                        Text(formatMillis(totalDuration), color = Color.White, fontSize = 12.sp)
+                        Text(formatMillis(currentTime), color = Color.White, fontSize = 11.sp)
+                        Text(formatMillis(totalDuration), color = Color.White, fontSize = 11.sp)
                     }
 
                     Slider(
@@ -396,6 +404,7 @@ fun VlcStylePlayerScreen(
                             currentTime = target
                             mediaPlayer.setTime(target)
                         },
+                        modifier = Modifier.height(26.dp),
                         colors = SliderDefaults.colors(
                             thumbColor = Color(0xFFFF8800),
                             activeTrackColor = Color(0xFFFF8800)
@@ -408,18 +417,18 @@ fun VlcStylePlayerScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row {
-                            IconButton(onClick = onSelectTracks) {
-                                Icon(Icons.Rounded.Subtitles, contentDescription = "Tracks", tint = Color.White)
+                            IconButton(onClick = onSelectTracks, modifier = Modifier.size(38.dp)) {
+                                Icon(Icons.Rounded.Subtitles, contentDescription = "Tracks", tint = Color.White, modifier = Modifier.size(21.dp))
                             }
                             IconButton(onClick = {
                                 zoomMode = (zoomMode + 1) % 3
                                 when (zoomMode) {
-                                    0 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT); overlayText = "Normal" }
-                                    1 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FILL); overlayText = "Fill" }
+                                    0 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT); overlayText = "Best Fit" }
+                                    1 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN); overlayText = "Fit Screen" }
                                     2 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9); overlayText = "16:9" }
                                 }
-                            }) {
-                                Icon(Icons.Rounded.AspectRatio, contentDescription = "Zoom", tint = Color.White)
+                            }, modifier = Modifier.size(38.dp)) {
+                                Icon(Icons.Rounded.AspectRatio, contentDescription = "Zoom", tint = Color.White, modifier = Modifier.size(21.dp))
                             }
                         }
 
@@ -433,18 +442,17 @@ fun VlcStylePlayerScreen(
                                     isPlaying = true
                                 }
                             },
-                            modifier = Modifier.size(52.dp)
+                            modifier = Modifier.size(44.dp)
                         ) {
                             Icon(
                                 imageVector = if (isPlaying) Icons.Rounded.PauseCircleOutline else Icons.Rounded.PlayCircleOutline,
                                 contentDescription = "Play/Pause",
                                 tint = Color.White,
-                                modifier = Modifier.size(48.dp)
+                                modifier = Modifier.size(40.dp)
                             )
                         }
 
                         Row {
-                            // ম্যানুয়াল রোটেশন বাটন (চাপলে Landscape/Portrait স্থির লক থাকবে, নিজে থেকে ঘুরবে না)
                             IconButton(onClick = {
                                 val act = context as ComponentActivity
                                 val isNowLandscape = act.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -455,11 +463,11 @@ fun VlcStylePlayerScreen(
                                     act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
                                     overlayText = "Landscape"
                                 }
-                            }) {
-                                Icon(Icons.Rounded.ScreenRotation, contentDescription = "Rotate", tint = Color.White)
+                            }, modifier = Modifier.size(38.dp)) {
+                                Icon(Icons.Rounded.ScreenRotation, contentDescription = "Rotate", tint = Color.White, modifier = Modifier.size(21.dp))
                             }
-                            IconButton(onClick = { showSideMenu = !showSideMenu }) {
-                                Icon(Icons.Rounded.MoreHoriz, contentDescription = "More", tint = Color.White)
+                            IconButton(onClick = { showSideMenu = !showSideMenu }, modifier = Modifier.size(38.dp)) {
+                                Icon(Icons.Rounded.MoreHoriz, contentDescription = "More", tint = Color.White, modifier = Modifier.size(21.dp))
                             }
                         }
                     }
@@ -467,7 +475,7 @@ fun VlcStylePlayerScreen(
             }
         }
 
-        // VLC সাইড মেনু (স্পিড কন্ট্রোলের জন্য সরাসরি - এবং + বাটনসহ)
+        // কার্ভড সাইড মেনু
         AnimatedVisibility(
             visible = showSideMenu && !isLocked && !isPipMode,
             enter = slideInHorizontally(initialOffsetX = { it }),
@@ -475,11 +483,13 @@ fun VlcStylePlayerScreen(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
                 .safeDrawingPadding()
+                .padding(vertical = 12.dp)
         ) {
             Column(
                 modifier = Modifier
-                    .width(250.dp)
+                    .width(245.dp)
                     .fillMaxHeight()
+                    .clip(RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp))
                     .background(Color(0xEE1E1A17))
                     .verticalScroll(rememberScrollState())
                     .padding(16.dp),
@@ -488,7 +498,6 @@ fun VlcStylePlayerScreen(
                 SideMenuItem(Icons.Rounded.LockOpen, "Lock") { isLocked = true; showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Bedtime, "Sleep timer") { showSleepDialog = true; showSideMenu = false }
 
-                // Playback Speed Row: [-] 1.0x [+]
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
