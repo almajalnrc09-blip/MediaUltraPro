@@ -287,7 +287,6 @@ fun MainAppContainer(
         permissionLauncher.launch(perms.toTypedArray())
     }
 
-    // YouTube ফুলস্ক্রিন ভিউ + স্ক্রিন লক ও ব্রাইটনেস/ভলিউম গেসচার
     if (fullscreenView != null) {
         var ytLocked by remember { mutableStateOf(false) }
         var gestureHud by remember { mutableStateOf("") }
@@ -323,7 +322,6 @@ fun MainAppContainer(
                 }
             )
 
-            // লক করা থাকলে বা গেসচার সক্রিয় থাকলে কন্ট্রোল লেয়ার
             if (ytLocked) {
                 Box(
                     modifier = Modifier
@@ -344,7 +342,6 @@ fun MainAppContainer(
                     }
                 }
             } else {
-                // বাম-ডান edge-এর ওপর ব্রাইটনেস/ভলিউম সোয়াইপ জোন (YouTube-এর নিজস্ব ট্যাপ নষ্ট না করে)
                 Row(modifier = Modifier.fillMaxSize()) {
                     Box(
                         modifier = Modifier
@@ -385,7 +382,6 @@ fun MainAppContainer(
                     )
                 }
 
-                // স্ক্রিন লক ও এক্সিট বাটন
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
@@ -672,7 +668,6 @@ fun YouTubeTabScreen(
             }
         )
 
-        // দ্রুত লিংক কপি ও শেয়ার ফ্লোটিং বাটন
         Row(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
