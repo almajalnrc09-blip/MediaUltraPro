@@ -12,6 +12,7 @@ import android.media.audiofx.Equalizer
 import android.os.Build
 import android.os.IBinder
 import androidx.annotation.OptIn
+import androidx.core.app.NotificationCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Player
@@ -87,48 +88,98 @@ class MusicPlaybackService : MediaSessionService() {
     }
 }
 
-// YouTube ব্যাকগ্রাউন্ড সার্ভিস (নোটিফিকেশনে ট্যাপ করলেই মেইন অ্যাপ খুলবে)
+// YouTube ব্যাকগ্রাউন্ড ও লক-স্ক্রিন নোটিফিকেশন সার্ভিস (Play/Pause ও Stop বাটনসহ)
 class YouTubeBackgroundService : Service() {
+
+    companion object {
+        const val CHANNEL_ID = "yt_bg_playback_v2"
+        const val NOTIFICATION_ID = 202
+        const val ACTION_YT_TOGGLE_PLAY = "com.example.ultramediapro.YT_TOGGLE_PLAY"
+        const val ACTION_YT_STOP_BG = "com.example.ultramediapro.YT_STOP_BG"
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val channelId = "yt_bg_playback"
+        val isPlaying = intent?.getBooleanExtra("IS_PLAYING", true) ?: true
+
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                channelId,
+                CHANNEL_ID,
                 "YouTube Background Playback",
-                NotificationManager.IMPORTANCE_LOW
-            )
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                setSound(null, null)
+                enableVibration(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
             manager.createNotificationChannel(channel)
         }
 
         val openIntent = Intent(this, MainActivity::class.java).apply {
             this.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
-        val pendingIntent = PendingIntent.getActivity(
+        val openPendingIntent = PendingIntent.getActivity(
             this,
             0,
             openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = Notification.Builder(this, channelId)
-            .setContentTitle("MediaUltraPro")
-            .setContentText("YouTube ব্যাকগ্রাউন্ডে চলছে — খুলতে ট্যাপ করুন")
+        val toggleIntent = Intent(ACTION_YT_TOGGLE_PLAY).setPackage(packageName)
+        val togglePendingIntent = PendingIntent.getBroadcast(
+            this,
+            1,
+            toggleIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopIntent = Intent(ACTION_YT_STOP_BG).setPackage(packageName)
+        val stopPendingIntent = PendingIntent.getBroadcast(
+            this,
+            2,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val toggleIcon = if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val toggleLabel = if (isPlaying) "Pause" else "Play"
+        val statusText = if (isPlaying) "YouTube ব্যাকগ্রাউন্ডে চলছে — খুলতে ট্যাপ করুন" else "YouTube পজ করা আছে — খুলতে ট্যাপ করুন"
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("MediaUltraPro • YouTube")
+            .setContentText(statusText)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentIntent(pendingIntent)
-            .setOngoing(true)
+            .setContentIntent(openPendingIntent)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setSilent(true)
+            .setOngoing(isPlaying)
+            .addAction(toggleIcon, toggleLabel, togglePendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
             .build()
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(202, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
             } else {
-                startForeground(202, notification)
+                startForeground(NOTIFICATION_ID, notification)
             }
         } catch (_: Exception) { }
 
         return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (_: Exception) { }
+        super.onDestroy()
     }
 }
