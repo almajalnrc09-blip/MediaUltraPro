@@ -34,7 +34,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -93,12 +93,11 @@ class MainActivity : ComponentActivity() {
             var isDarkTheme by remember { mutableStateOf(prefs.getBoolean("dark_mode", true)) }
             val view = LocalView.current
 
-            // সময়, Wi-Fi ও ব্যাটারি আইকন সব ট্যাবে স্পষ্ট দেখানোর জন্য স্ট্যাটাস বার কালার সমন্বয়
             SideEffect {
                 val controller = WindowInsetsControllerCompat(window, view)
                 val useDarkStatusIcons = when {
                     customFullscreenView != null -> false
-                    selectedTab == 0 -> false // YouTube ডার্ক ব্যাকগ্রাউন্ডে সাদা আইকন
+                    selectedTab == 0 -> false
                     else -> !isDarkTheme
                 }
                 controller.isAppearanceLightStatusBars = useDarkStatusIcons
@@ -170,7 +169,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        // শুধু YouTube আসলেই চালু থাকলে তবেই ব্যাকগ্রাউন্ড সার্ভিস চলবে
         if (selectedTab == 0 && isYouTubePlaying) {
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
@@ -187,7 +185,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        // পজ করা ভিডিও কখনোই আর নিজে থেকে চালু হবে না বা PiP খুলবে না
         if (selectedTab == 0 && isYouTubePlaying && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             activeWebView?.evaluateJavascript(
                 """
@@ -196,10 +193,13 @@ class MainActivity : ComponentActivity() {
                     if (!s) {
                         s = document.createElement('style');
                         s.id = 'ultra-pip-css';
-                        s.innerHTML = 'ytm-mobile-topbar-renderer, .watch-below-the-player, ytm-pivot-bar-renderer, .player-controls-content { display: none !important; } ' +
-                            '#player-container-id, .player-container, .html5-video-player, video { position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; z-index: 999999 !important; background: #000 !important; object-fit: contain !important; }';
+                        s.innerHTML = 'html, body { background: #000 !important; overflow: hidden !important; } ' +
+                            'ytm-mobile-topbar-renderer, .watch-below-the-player, ytm-pivot-bar-renderer, .related-items-container { display: none !important; } ' +
+                            '#player-container-id, .player-container, .html5-video-player, .video-stream, video { position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; z-index: 2147483647 !important; background: #000 !important; object-fit: contain !important; opacity: 1 !important; visibility: visible !important; }';
                         document.head.appendChild(s);
                     }
+                    var v = document.querySelector('video');
+                    if (v && v.paused) { v.play().catch(function(){}); }
                 })();
                 """.trimIndent(), null
             )
@@ -285,7 +285,7 @@ fun MainAppContainer(
         return
     }
 
-    // সব ট্যাবের জন্য ডাবল-ব্যাক এক্সিট হ্যান্ডলার
+    // YouTube-এ ব্যাক চাপলে আগে ভেতরে পেছনে যাবে, তারপর ডাবল-ব্যাক এক্সিট
     BackHandler(enabled = !isMusicFullPlayerOpen) {
         if (selectedTab == 0) {
             val wv = activity.activeWebView
@@ -331,7 +331,6 @@ fun MainAppContainer(
             }
         },
         bottomBar = {
-            // আল্ট্রা-স্লিম 40dp বটম বার
             if (!isPipMode && !isMusicFullPlayerOpen) {
                 Surface(
                     tonalElevation = 2.dp,
@@ -367,7 +366,6 @@ fun MainAppContainer(
         }
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize()) {
-            // YouTube ট্যাবে স্ট্যাটাস বার কালো ব্যাকগ্রাউন্ডে পরিষ্কার দেখাবে
             Box(
                 modifier = if (selectedTab == 0) {
                     Modifier
@@ -569,7 +567,7 @@ fun VideoListTabScreen() {
     }
 
     LazyColumn(modifier = Modifier.fillMaxSize()) {
-        items(videos, key = { it.id }) { video ->
+        itemsIndexed(videos, key = { _, item -> item.id }) { index, video ->
             var menuExpanded by remember { mutableStateOf(false) }
             ListItem(
                 modifier = Modifier.clickable {
@@ -580,7 +578,11 @@ fun VideoListTabScreen() {
                     context.startActivity(intent)
                 },
                 leadingContent = {
-                    Icon(Icons.Rounded.Movie, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("${index + 1}.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Icon(Icons.Rounded.Movie, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    }
                 },
                 headlineContent = { Text(video.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 supportingContent = { Text("${formatMillis(video.duration)} • ${video.sizeMb} MB") },
@@ -626,7 +628,9 @@ fun VideoListTabScreen() {
                     MediaScanner.deleteFile(activity, target.uri, deleteLauncher) { refreshKey++ }
                 }) { Text("Delete", color = Color.Red) }
             },
-            dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } }
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
+            }
         )
     }
 
@@ -655,7 +659,9 @@ fun VideoListTabScreen() {
                     }
                 }) { Text("Save") }
             },
-            dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
+            dismissButton = {
+                TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
+            }
         )
     }
 }
@@ -752,6 +758,12 @@ fun MuzioMusicTabScreen(
         }
     }
 
+    fun stopAndDismissMiniPlayer() {
+        mediaController?.stop()
+        onSongChanged(null)
+        showFullPlayer = false
+    }
+
     fun toggleFavorite(songId: Long) {
         val idStr = songId.toString()
         val updated = if (favoriteIds.contains(idStr)) favoriteIds - idStr else favoriteIds + idStr
@@ -838,20 +850,24 @@ fun MuzioMusicTabScreen(
                     modifier = Modifier.weight(1f),
                     contentPadding = PaddingValues(bottom = 90.dp)
                 ) {
-                    items(displayedSongs, key = { it.id }) { song ->
+                    itemsIndexed(displayedSongs, key = { _, item -> item.id }) { index, song ->
                         var menuExpanded by remember { mutableStateOf(false) }
                         ListItem(
                             colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                             modifier = Modifier.clickable { playSong(song) },
                             leadingContent = {
-                                Box(
-                                    modifier = Modifier
-                                        .size(44.dp)
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .background(iconBoxColor),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = accentColor)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("${index + 1}.", color = subColor, fontSize = 12.sp)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .size(42.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(iconBoxColor),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = accentColor)
+                                    }
                                 }
                             },
                             headlineContent = {
@@ -899,7 +915,6 @@ fun MuzioMusicTabScreen(
             }
         }
 
-        // ভাসমান শাফেল বাটন
         FloatingActionButton(
             onClick = {
                 if (displayedSongs.isNotEmpty()) {
@@ -919,7 +934,7 @@ fun MuzioMusicTabScreen(
             Icon(Icons.Rounded.Shuffle, contentDescription = "Shuffle")
         }
 
-        // মিনি-প্লেয়ার বার
+        // মিনি-প্লেয়ার বার (Close × বাটনসহ)
         currentSong?.let { song ->
             Row(
                 modifier = Modifier
@@ -927,27 +942,29 @@ fun MuzioMusicTabScreen(
                     .fillMaxWidth()
                     .background(miniPlayerBg)
                     .clickable { showFullPlayer = true }
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                    .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Rounded.Album, contentDescription = null, tint = accentColor, modifier = Modifier.size(34.dp))
-                Spacer(modifier = Modifier.width(10.dp))
+                Icon(Icons.Rounded.Album, contentDescription = null, tint = accentColor, modifier = Modifier.size(32.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(song.title, color = titleColor, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(song.title, color = titleColor, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     Text(song.artist, color = subColor, fontSize = 11.sp, maxLines = 1)
                 }
                 IconButton(onClick = {
                     if (isPlaying) mediaController?.pause() else mediaController?.play()
-                }) {
+                }, modifier = Modifier.size(36.dp)) {
                     Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, contentDescription = "Play", tint = titleColor)
                 }
-                IconButton(onClick = { showEqualizer = true }) {
+                IconButton(onClick = { showEqualizer = true }, modifier = Modifier.size(36.dp)) {
                     Icon(Icons.Rounded.Equalizer, contentDescription = "EQ", tint = accentColor)
+                }
+                IconButton(onClick = { stopAndDismissMiniPlayer() }, modifier = Modifier.size(36.dp)) {
+                    Icon(Icons.Rounded.Close, contentDescription = "Close Player", tint = subColor)
                 }
             }
         }
 
-        // ফুলস্ক্রিন মিউজিক প্লেয়ার
         if (showFullPlayer && currentSong != null) {
             BackHandler { showFullPlayer = false }
             val song = currentSong
@@ -1092,9 +1109,9 @@ fun MuzioMusicTabScreen(
                 title = { Text("Playing Queue (${displayedSongs.size})") },
                 text = {
                     LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
-                        items(displayedSongs, key = { it.id }) { s ->
+                        itemsIndexed(displayedSongs, key = { _, item -> item.id }) { idx, s ->
                             Text(
-                                text = s.title,
+                                text = "${idx + 1}. ${s.title}",
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 fontWeight = if (s.id == currentSong?.id) FontWeight.Bold else FontWeight.Normal,
