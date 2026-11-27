@@ -16,6 +16,9 @@ import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -86,12 +89,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
-class YouTubeJsBridge(private val onPlayingChanged: (Boolean) -> Unit) {
+class YouTubeJsBridge(private val onStateChanged: (playing: Boolean, wantPlay: Boolean) -> Unit) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @JavascriptInterface
-    fun reportPlaying(playing: Boolean) {
-        mainHandler.post { onPlayingChanged(playing) }
+    fun reportState(playing: Boolean, wantPlay: Boolean) {
+        mainHandler.post { onStateChanged(playing, wantPlay) }
     }
 }
 
@@ -101,10 +104,15 @@ class MainActivity : ComponentActivity() {
     private var isPipMode by mutableStateOf(false)
     private var isMusicFullPlayerOpen by mutableStateOf(false)
     private var lastIsDarkTheme: Boolean = false
+    private var isAppInBackground: Boolean = false
     @Volatile var isYouTubePlaying: Boolean = false
+    @Volatile var userWantsYouTubePlay: Boolean = false
     var activeWebView: BackgroundWebView? = null
     var customFullscreenView by mutableStateOf<View?>(null)
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
+
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { }
 
     private val ytActionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -113,27 +121,23 @@ class MainActivity : ComponentActivity() {
                     activeWebView?.onResume()
                     activeWebView?.resumeTimers()
                     activeWebView?.evaluateJavascript(
-                        """
-                        (function() {
-                            var v = document.querySelector('video');
-                            if (v) {
-                                if (v.paused) { v.play().catch(function(){}); }
-                                else { v.pause(); }
-                            }
-                        })();
-                        """.trimIndent(), null
+                        "if (window.__ultraTogglePlay) { window.__ultraTogglePlay(); }",
+                        null
                     )
-                    isYouTubePlaying = !isYouTubePlaying
-                    updatePipParamsIfNeeded()
-                    startOrUpdateYouTubeNotification(isYouTubePlaying)
                 }
                 YouTubeBackgroundService.ACTION_YT_STOP_BG -> {
                     activeWebView?.evaluateJavascript(
-                        "var v = document.querySelector('video'); if (v) { v.pause(); }",
+                        "if (window.__ultraForcePause) { window.__ultraForcePause(); }",
                         null
                     )
                     isYouTubePlaying = false
+                    userWantsYouTubePlay = false
+                    abandonYouTubeAudioFocus()
                     stopService(Intent(this@MainActivity, YouTubeBackgroundService::class.java))
+                    // Stop চাপলে PiP উইন্ডোটিও সাথে সাথে বন্ধ হয়ে যাবে
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
+                        moveTaskToBack(true)
+                    }
                 }
             }
         }
@@ -194,7 +198,40 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Light/Dark মোডে সময়, Wi-Fi ও ব্যাটারি আইকন স্পষ্ট রাখার জন্য সিস্টেম বার আপডেট
+    private fun requestYouTubeAudioFocus() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (audioFocusRequest == null) {
+                    val attrs = AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .build()
+                    audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(attrs)
+                        .setOnAudioFocusChangeListener(audioFocusListener)
+                        .build()
+                }
+                audioFocusRequest?.let { am.requestAudioFocus(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                am.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun abandonYouTubeAudioFocus() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(audioFocusListener)
+            }
+        } catch (_: Exception) { }
+    }
+
     fun applySystemBarAppearance(isDarkTheme: Boolean) {
         window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
         @Suppress("DEPRECATION")
@@ -204,9 +241,9 @@ class MainActivity : ComponentActivity() {
 
         val useDarkStatusIcons = when {
             customFullscreenView != null -> false
-            selectedTab == 0 -> false // YouTube কালো ব্যাকগ্রাউন্ডে সাদা আইকন
-            selectedTab == 2 && isMusicFullPlayerOpen -> false // ফুল মিউজিক প্লেয়ারে সাদা আইকন
-            else -> !isDarkTheme // Light মোডে কালো আইকন, Dark মোডে সাদা আইকন
+            selectedTab == 0 -> false
+            selectedTab == 2 && isMusicFullPlayerOpen -> false
+            else -> !isDarkTheme
         }
         val useDarkNavIcons = !isDarkTheme
 
@@ -285,6 +322,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    fun onYouTubeStateUpdated(playing: Boolean, wantPlay: Boolean) {
+        val changed = isYouTubePlaying != playing
+        isYouTubePlaying = playing
+        userWantsYouTubePlay = wantPlay
+        if (changed) {
+            updatePipParamsIfNeeded()
+            if (isAppInBackground || isPipMode) {
+                startOrUpdateYouTubeNotification(playing)
+            }
+        }
+    }
+
     fun startOrUpdateYouTubeNotification(playing: Boolean) {
         try {
             val intent = Intent(this, YouTubeBackgroundService::class.java).apply {
@@ -307,7 +356,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        stopService(Intent(this, YouTubeBackgroundService::class.java))
+        isAppInBackground = false
+        if (!isPipMode) {
+            stopService(Intent(this, YouTubeBackgroundService::class.java))
+            activeWebView?.evaluateJavascript("window.__ultraInBg = false;", null)
+        }
         activeWebView?.onResume()
         activeWebView?.resumeTimers()
         applySystemBarAppearance(lastIsDarkTheme)
@@ -315,28 +368,43 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        if (selectedTab == 0 && (isYouTubePlaying || customFullscreenView != null)) {
+        isAppInBackground = true
+        if (selectedTab == 0 && (isYouTubePlaying || userWantsYouTubePlay || customFullscreenView != null)) {
+            requestYouTubeAudioFocus()
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
-            startOrUpdateYouTubeNotification(true)
+            activeWebView?.evaluateJavascript(
+                "window.__ultraInBg = true; if (window.__ultraEnsurePlay) window.__ultraEnsurePlay();",
+                null
+            )
+            startOrUpdateYouTubeNotification(isYouTubePlaying || userWantsYouTubePlay)
         }
     }
 
     override fun onStop() {
         super.onStop()
-        if (selectedTab == 0 && (isYouTubePlaying || customFullscreenView != null)) {
+        isAppInBackground = true
+        if (selectedTab == 0 && (isYouTubePlaying || userWantsYouTubePlay || customFullscreenView != null)) {
+            requestYouTubeAudioFocus()
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
-            startOrUpdateYouTubeNotification(true)
+            activeWebView?.evaluateJavascript(
+                "window.__ultraInBg = true; if (window.__ultraEnsurePlay) window.__ultraEnsurePlay();",
+                null
+            )
+            startOrUpdateYouTubeNotification(isYouTubePlaying || userWantsYouTubePlay)
         }
     }
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (selectedTab == 0 && (isYouTubePlaying || customFullscreenView != null) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (selectedTab == 0 && (isYouTubePlaying || userWantsYouTubePlay || customFullscreenView != null) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            requestYouTubeAudioFocus()
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
+            activeWebView?.evaluateJavascript("window.__ultraInBg = true;", null)
             if (customFullscreenView == null) {
+                // কালো লেয়ার না বসিয়ে শুধু হেডার/কমেন্ট হাইড করে পরিষ্কার ভিডিও ফ্রেম PiP-তে আনা
                 activeWebView?.evaluateJavascript(
                     """
                     (function() {
@@ -344,15 +412,22 @@ class MainActivity : ComponentActivity() {
                         if (!s) {
                             s = document.createElement('style');
                             s.id = 'ultra-pip-css';
-                            s.innerHTML = 'html, body { width: 100vw !important; height: 100vh !important; min-width: 0 !important; margin: 0 !important; padding: 0 !important; overflow: hidden !important; background: #000 !important; } ' +
-                                'ytm-mobile-topbar-renderer, .watch-below-the-player, ytm-pivot-bar-renderer, .related-items-container, .player-controls-content, ytm-custom-control, .ytp-chrome-top, .ytp-chrome-bottom { display: none !important; } ' +
-                                '#player-container-id, .player-container, .html5-video-player, video.html5-main-video, video { position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; object-fit: contain !important; background: #000 !important; z-index: 2147483647 !important; }';
+                            s.innerHTML = 'ytm-mobile-topbar-renderer, #header-bar, .watch-below-the-player, ytm-pivot-bar-renderer, .related-items-container, ytm-item-section-renderer, .player-controls-content, ytm-custom-control, .ytp-chrome-top, .ytp-chrome-bottom, .ytp-pause-overlay { display: none !important; } ' +
+                                'html, body { margin: 0 !important; padding: 0 !important; overflow: hidden !important; background: #000 !important; } ' +
+                                '#player-container-id { position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-height: 100vh !important; margin: 0 !important; padding: 0 !important; } ' +
+                                '.html5-video-player, .html5-video-container { width: 100% !important; height: 100% !important; background: transparent !important; } ' +
+                                'video.html5-main-video, video { width: 100% !important; height: 100% !important; top: 0 !important; left: 0 !important; object-fit: contain !important; }';
                             document.head.appendChild(s);
                         }
-                        var v = document.querySelector('video');
-                        if (v && v.paused) { v.play().catch(function(){}); }
+                        window.scrollTo(0, 0);
+                        if (window.__ultraEnsurePlay) window.__ultraEnsurePlay();
                     })();
                     """.trimIndent(), null
+                )
+            } else {
+                activeWebView?.evaluateJavascript(
+                    "if (window.__ultraEnsurePlay) window.__ultraEnsurePlay();",
+                    null
                 )
             }
             try {
@@ -369,9 +444,15 @@ class MainActivity : ComponentActivity() {
         isPipMode = isInPictureInPictureMode
         activeWebView?.onResume()
         activeWebView?.resumeTimers()
-        if (!isInPictureInPictureMode) {
+        if (isInPictureInPictureMode) {
             activeWebView?.evaluateJavascript(
-                "var s = document.getElementById('ultra-pip-css'); if (s) s.remove();",
+                "window.__ultraInBg = true; if (window.__ultraEnsurePlay) window.__ultraEnsurePlay();",
+                null
+            )
+            startOrUpdateYouTubeNotification(isYouTubePlaying || userWantsYouTubePlay)
+        } else {
+            activeWebView?.evaluateJavascript(
+                "window.__ultraInBg = false; var s = document.getElementById('ultra-pip-css'); if (s) s.remove();",
                 null
             )
             if (customFullscreenView == null) {
@@ -383,6 +464,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         try { unregisterReceiver(ytActionReceiver) } catch (_: Exception) { }
+        abandonYouTubeAudioFocus()
         stopService(Intent(this, YouTubeBackgroundService::class.java))
         super.onDestroy()
     }
@@ -461,7 +543,7 @@ fun MainAppContainer(
             }
         ) { padding ->
             Box(modifier = Modifier.fillMaxSize()) {
-                // YouTube ট্যাবের নিচে 52dp জায়গা রাখা হয়েছে যাতে ফ্লোটিং বার Home/Shorts/You-কে ঢেকে না দেয়
+                // YouTube-এর নিচে ঠিক 41dp জায়গা রাখা হয়েছে যাতে Home/Shorts/You ফ্লোটিং বারের গা ঘেঁষে থাকে
                 Box(
                     modifier = if (selectedTab == 0) {
                         Modifier
@@ -472,7 +554,7 @@ fun MainAppContainer(
                                     Modifier
                                         .statusBarsPadding()
                                         .navigationBarsPadding()
-                                        .padding(bottom = 52.dp)
+                                        .padding(bottom = 41.dp)
                                 } else {
                                     Modifier
                                 }
@@ -506,21 +588,21 @@ fun MainAppContainer(
             }
         }
 
-        // স্লিম ফিক্সড ফ্লোটিং পিল নেভিগেশন বার
+        // আল্ট্রা-স্লিম 36dp ফিক্সড ফ্লোটিং পিল নেভিগেশন বার
         if (!isPipMode && !isMusicFullPlayerOpen && fullscreenView == null) {
             Surface(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(bottom = 6.dp),
-                shape = RoundedCornerShape(22.dp),
+                    .padding(bottom = 4.dp),
+                shape = RoundedCornerShape(20.dp),
                 tonalElevation = 6.dp,
                 shadowElevation = 10.dp,
                 color = if (isDarkTheme) Color(0xE6221616) else Color(0xF5FFFFFF)
             ) {
                 Row(
                     modifier = Modifier
-                        .height(38.dp)
+                        .height(36.dp)
                         .padding(horizontal = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -610,14 +692,14 @@ fun CompactTabIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, select
             .clip(RoundedCornerShape(16.dp))
             .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent)
             .clickable { onClick() }
-            .padding(horizontal = 20.dp, vertical = 4.dp),
+            .padding(horizontal = 20.dp, vertical = 3.dp),
         contentAlignment = Alignment.Center
     ) {
         Icon(
             imageVector = icon,
             contentDescription = null,
             tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),
-            modifier = Modifier.size(21.dp)
+            modifier = Modifier.size(20.dp)
         )
     }
 }
@@ -642,9 +724,13 @@ fun YouTubeTabScreen(
                 Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
                 Object.defineProperty(document, 'webkitHidden', { get: function() { return false; }, configurable: true });
                 Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; }, configurable: true });
-                window.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
-                document.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
-                window.addEventListener('webkitvisibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
+                document.hasFocus = function() { return true; };
+
+                var stopEvt = function(e) { e.stopImmediatePropagation(); };
+                ['visibilitychange', 'webkitvisibilitychange', 'pagehide', 'freeze', 'blur'].forEach(function(evt) {
+                    window.addEventListener(evt, stopEvt, true);
+                    document.addEventListener(evt, stopEvt, true);
+                });
 
                 var hideStyle = document.getElementById('ultra-open-app-hide');
                 if (!hideStyle) {
@@ -654,25 +740,97 @@ fun YouTubeTabScreen(
                     document.head.appendChild(hideStyle);
                 }
 
-                function cleanUiAndTrack() {
-                    document.querySelectorAll('a, button, ytm-button-renderer, c3-material-button').forEach(function(el) {
-                        var txt = (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
-                        if (txt === 'open app') {
-                            var wrap = el.closest('ytm-button-renderer, c3-material-button') || el;
-                            wrap.style.display = 'none';
-                        }
-                    });
-                    var v = document.querySelector('video');
-                    if (window.UltraBridge) {
-                        var playing = !!(v && !v.paused && !v.ended && v.readyState > 1);
-                        window.UltraBridge.reportPlaying(playing);
-                    }
-                }
                 if (!window.__ultraTrackerInstalled) {
                     window.__ultraTrackerInstalled = true;
-                    setInterval(cleanUiAndTrack, 500);
+                    window.__ultraWantPlay = false;
+                    window.__ultraInBg = false;
+                    window.__ultraLastTouch = 0;
+
+                    document.addEventListener('touchstart', function() { window.__ultraLastTouch = Date.now(); }, true);
+                    document.addEventListener('click', function() { window.__ultraLastTouch = Date.now(); }, true);
+
+                    window.__ultraReport = function() {
+                        var v = document.querySelector('video');
+                        var playing = !!(v && !v.paused && !v.ended && v.readyState > 1);
+                        if (window.UltraBridge) {
+                            window.UltraBridge.reportState(playing, !!window.__ultraWantPlay);
+                        }
+                    };
+
+                    window.__ultraEnsurePlay = function() {
+                        var v = document.querySelector('video');
+                        if (v && window.__ultraWantPlay && v.paused && !v.ended) {
+                            v.play().catch(function(){});
+                        }
+                        setTimeout(function() {
+                            var v2 = document.querySelector('video');
+                            if (v2 && window.__ultraWantPlay && v2.paused && !v2.ended) {
+                                v2.play().catch(function(){});
+                            }
+                            window.__ultraReport();
+                        }, 250);
+                    };
+
+                    window.__ultraTogglePlay = function() {
+                        var v = document.querySelector('video');
+                        if (!v) return;
+                        if (v.paused) {
+                            window.__ultraWantPlay = true;
+                            v.play().catch(function(){});
+                        } else {
+                            window.__ultraWantPlay = false;
+                            v.pause();
+                        }
+                        setTimeout(window.__ultraReport, 120);
+                    };
+
+                    window.__ultraForcePause = function() {
+                        window.__ultraWantPlay = false;
+                        var v = document.querySelector('video');
+                        if (v) v.pause();
+                        window.__ultraReport();
+                    };
+
+                    function hookVideo(v) {
+                        if (!v || v.__ultraHooked) return;
+                        v.__ultraHooked = true;
+                        v.addEventListener('play', function() {
+                            window.__ultraWantPlay = true;
+                            window.__ultraReport();
+                        });
+                        v.addEventListener('pause', function() {
+                            var userTappedRecently = (Date.now() - window.__ultraLastTouch) < 700;
+                            if (userTappedRecently && !window.__ultraInBg) {
+                                window.__ultraWantPlay = false;
+                            } else if (window.__ultraInBg && window.__ultraWantPlay && !v.ended) {
+                                setTimeout(function() {
+                                    if (window.__ultraInBg && window.__ultraWantPlay && v.paused && !v.ended) {
+                                        v.play().catch(function(){});
+                                    }
+                                }, 150);
+                            }
+                            window.__ultraReport();
+                        });
+                        v.addEventListener('ended', function() {
+                            window.__ultraWantPlay = false;
+                            window.__ultraReport();
+                        });
+                    }
+
+                    setInterval(function() {
+                        document.querySelectorAll('a, button, ytm-button-renderer, yt-button-shape, c3-material-button').forEach(function(el) {
+                            var txt = (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                            var href = (el.getAttribute('href') || '').toLowerCase();
+                            if (txt === 'open app' || txt.indexOf('open app') !== -1 || href.indexOf('redirect_app_store') !== -1 || href.indexOf('intent://') === 0) {
+                                var wrap = el.closest('ytm-button-renderer, c3-material-button, yt-button-shape') || el;
+                                wrap.style.setProperty('display', 'none', 'important');
+                            }
+                        });
+                        var v = document.querySelector('video');
+                        hookVideo(v);
+                        window.__ultraReport();
+                    }, 500);
                 }
-                cleanUiAndTrack();
             } catch(e) {}
         })();
     """.trimIndent()
@@ -686,11 +844,8 @@ fun YouTubeTabScreen(
             val webView = BackgroundWebView(ctx)
             activity.activeWebView = webView
             webView.addJavascriptInterface(
-                YouTubeJsBridge { playing ->
-                    if (activity.isYouTubePlaying != playing) {
-                        activity.isYouTubePlaying = playing
-                        activity.updatePipParamsIfNeeded()
-                    }
+                YouTubeJsBridge { playing, wantPlay ->
+                    activity.onYouTubeStateUpdated(playing, wantPlay)
                 },
                 "UltraBridge"
             )
@@ -706,6 +861,8 @@ fun YouTubeTabScreen(
                 cacheMode = WebSettings.LOAD_DEFAULT
                 useWideViewPort = true
                 loadWithOverviewMode = true
+                // স্ট্যান্ডার্ড মোবাইল Chrome-এর মতো User-Agent (wv ফ্ল্যাগ বাদ)
+                userAgentString = userAgentString.replace("; wv", "")
             }
 
             webView.webViewClient = object : WebViewClient() {
@@ -803,7 +960,7 @@ fun VideoListTabScreen() {
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().navigationBarsPadding(),
-        contentPadding = PaddingValues(bottom = 72.dp)
+        contentPadding = PaddingValues(bottom = 64.dp)
     ) {
         itemsIndexed(videos, key = { _, item -> item.id }) { index, video ->
             var menuExpanded by remember { mutableStateOf(false) }
@@ -1011,7 +1168,6 @@ fun MuzioMusicTabScreen(
         }
     }
 
-    // Playing Queue-তে সাজানো অর্ডার অনুযায়ী গানের তালিকা
     val orderedQueue = remember(displayedSongs, customQueueOrder) {
         if (customQueueOrder.isEmpty()) {
             displayedSongs
@@ -1037,7 +1193,6 @@ fun MuzioMusicTabScreen(
     val latestShuffle by rememberUpdatedState(shuffleEnabled)
     val latestRepeat by rememberUpdatedState(repeatMode)
 
-    // একটি গান শেষ হলে কিউ-এর সাজানো পরের গানটি অটোমেটিক চালানো
     DisposableEffect(mediaController) {
         val ctrl = mediaController
         val listener = object : Player.Listener {
@@ -1168,7 +1323,7 @@ fun MuzioMusicTabScreen(
             } else {
                 LazyColumn(
                     modifier = Modifier.weight(1f).navigationBarsPadding(),
-                    contentPadding = PaddingValues(bottom = 140.dp)
+                    contentPadding = PaddingValues(bottom = 132.dp)
                 ) {
                     itemsIndexed(orderedQueue, key = { _, item -> item.id }) { index, song ->
                         var menuExpanded by remember { mutableStateOf(false) }
@@ -1259,7 +1414,7 @@ fun MuzioMusicTabScreen(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .navigationBarsPadding()
-                .padding(end = 18.dp, bottom = if (currentSong != null) 120.dp else 60.dp)
+                .padding(end = 18.dp, bottom = if (currentSong != null) 114.dp else 54.dp)
         ) {
             Icon(
                 imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
@@ -1274,7 +1429,7 @@ fun MuzioMusicTabScreen(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(start = 10.dp, end = 10.dp, bottom = 54.dp)
+                    .padding(start = 10.dp, end = 10.dp, bottom = 48.dp)
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
                     .background(miniPlayerBg)
@@ -1492,7 +1647,6 @@ fun MuzioMusicTabScreen(
             )
         }
 
-        // Playing Queue ডায়ালগ — ওপরে (↑) ও নিচে (↓) সরিয়ে সিরিয়াল বদলানোর সুবিধাসহ
         if (showQueueDialog) {
             AlertDialog(
                 onDismissRequest = { showQueueDialog = false },
