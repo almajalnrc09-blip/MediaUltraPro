@@ -67,16 +67,41 @@ class VideoPlayerActivity : ComponentActivity() {
     private var isBackgroundAudioMode = false
     private var isPipMode by mutableStateOf(false)
 
+    private var videoUris: List<String> = emptyList()
+    private var videoTitles: List<String> = emptyList()
+    private var currentIndex by mutableIntStateOf(0)
+    private var currentTitle by mutableStateOf("Video")
+    private var currentSavedResumePos by mutableLongStateOf(0L)
+
     private val resumeKeyPrefix = "resume_pos_"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // নচ/কাটআউট এরিয়াসহ পুরো স্ক্রিন জুড়ে ভিডিও দেখানোর জন্য
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
         hideSystemBars()
 
-        val videoUriString = intent.getStringExtra("VIDEO_URI") ?: return finish()
-        val videoTitle = intent.getStringExtra("VIDEO_TITLE") ?: "Video"
+        val passedUris = intent.getStringArrayListExtra("VIDEO_URIS")
+        val passedTitles = intent.getStringArrayListExtra("VIDEO_TITLES")
+        val fallbackUri = intent.getStringExtra("VIDEO_URI")
+        val fallbackTitle = intent.getStringExtra("VIDEO_TITLE") ?: "Video"
+
+        if (!passedUris.isNullOrEmpty() && !passedTitles.isNullOrEmpty() && passedUris.size == passedTitles.size) {
+            videoUris = passedUris
+            videoTitles = passedTitles
+            currentIndex = intent.getIntExtra("VIDEO_INDEX", 0).coerceIn(0, videoUris.lastIndex)
+        } else if (fallbackUri != null) {
+            videoUris = listOf(fallbackUri)
+            videoTitles = listOf(fallbackTitle)
+            currentIndex = 0
+        } else {
+            return finish()
+        }
 
         val options = ArrayList<String>().apply {
             add("--aout=opensles")
@@ -86,20 +111,7 @@ class VideoPlayerActivity : ComponentActivity() {
         libVLC = LibVLC(this, options)
         mediaPlayer = MediaPlayer(libVLC)
 
-        val uri = Uri.parse(videoUriString)
-        val media = try {
-            currentPfd = contentResolver.openFileDescriptor(uri, "r")
-            if (currentPfd != null) Media(libVLC, currentPfd!!.fileDescriptor) else Media(libVLC, uri)
-        } catch (_: Exception) {
-            Media(libVLC, uri)
-        }
-
-        media.setHWDecoderEnabled(true, false)
-        mediaPlayer.setMedia(media)
-        media.release()
-
-        val prefs = getSharedPreferences("video_resume_prefs", MODE_PRIVATE)
-        val savedPos = prefs.getLong(resumeKeyPrefix + videoUriString.hashCode(), 0L)
+        prepareMediaAt(currentIndex, autoPlay = false)
 
         setContent {
             val srtLauncher = rememberLauncherForActivityResult(
@@ -113,12 +125,32 @@ class VideoPlayerActivity : ComponentActivity() {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 VlcStylePlayerScreen(
                     mediaPlayer = mediaPlayer,
-                    videoTitle = videoTitle,
-                    savedResumePos = savedPos,
+                    videoTitle = currentTitle,
+                    videoIndex = currentIndex,
+                    hasMultipleVideos = videoUris.size > 1,
+                    savedResumePos = currentSavedResumePos,
                     isPipMode = isPipMode,
                     onBack = {
-                        saveResumePosition(videoUriString)
+                        saveCurrentResumePosition()
                         finish()
+                    },
+                    onPrevVideo = {
+                        if (videoUris.size > 1) {
+                            saveCurrentResumePosition()
+                            val prevIdx = if (currentIndex > 0) currentIndex - 1 else videoUris.lastIndex
+                            prepareMediaAt(prevIdx, autoPlay = true)
+                        } else {
+                            Toast.makeText(this, "আর কোনো ভিডিও নেই", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    onNextVideo = {
+                        if (videoUris.size > 1) {
+                            saveCurrentResumePosition()
+                            val nextIdx = (currentIndex + 1) % videoUris.size
+                            prepareMediaAt(nextIdx, autoPlay = true)
+                        } else {
+                            Toast.makeText(this, "আর কোনো ভিডিও নেই", Toast.LENGTH_SHORT).show()
+                        }
                     },
                     onPickSubtitle = {
                         srtLauncher.launch(arrayOf("*/*"))
@@ -150,7 +182,7 @@ class VideoPlayerActivity : ComponentActivity() {
                             sleepTimer = object : CountDownTimer(minutes * 60 * 1000L, 1000) {
                                 override fun onTick(millisUntilFinished: Long) {}
                                 override fun onFinish() {
-                                    saveResumePosition(videoUriString)
+                                    saveCurrentResumePosition()
                                     mediaPlayer.pause()
                                     finish()
                                 }
@@ -164,6 +196,36 @@ class VideoPlayerActivity : ComponentActivity() {
         }
     }
 
+    private fun prepareMediaAt(index: Int, autoPlay: Boolean) {
+        if (index !in videoUris.indices) return
+        try {
+            mediaPlayer.stop()
+            currentPfd?.close()
+            currentPfd = null
+        } catch (_: Exception) { }
+
+        currentIndex = index
+        currentTitle = videoTitles[index]
+        val uriString = videoUris[index]
+        val prefs = getSharedPreferences("video_resume_prefs", MODE_PRIVATE)
+        currentSavedResumePos = prefs.getLong(resumeKeyPrefix + uriString.hashCode(), 0L)
+
+        val uri = Uri.parse(uriString)
+        val media = try {
+            currentPfd = contentResolver.openFileDescriptor(uri, "r")
+            if (currentPfd != null) Media(libVLC, currentPfd!!.fileDescriptor) else Media(libVLC, uri)
+        } catch (_: Exception) {
+            Media(libVLC, uri)
+        }
+
+        media.setHWDecoderEnabled(true, false)
+        mediaPlayer.setMedia(media)
+        media.release()
+        if (autoPlay) {
+            mediaPlayer.play()
+        }
+    }
+
     private fun attachExternalSubtitle(srtUri: Uri) {
         try {
             val subFile = File(cacheDir, "external_sub_${System.currentTimeMillis()}.srt")
@@ -172,7 +234,6 @@ class VideoPlayerActivity : ComponentActivity() {
                     input.copyTo(output)
                 }
             }
-            // LibVLC-এ সাবটাইটেল স্লেভ যুক্ত করা (type 0 = Subtitle)
             val added = try {
                 val method = mediaPlayer.javaClass.getMethod(
                     "addSlave",
@@ -195,12 +256,13 @@ class VideoPlayerActivity : ComponentActivity() {
         }
     }
 
-    private fun saveResumePosition(videoUriString: String) {
+    private fun saveCurrentResumePosition() {
+        val uriString = videoUris.getOrNull(currentIndex) ?: return
         try {
             val pos = mediaPlayer.time
             val len = mediaPlayer.length
             val prefs = getSharedPreferences("video_resume_prefs", MODE_PRIVATE)
-            val key = resumeKeyPrefix + videoUriString.hashCode()
+            val key = resumeKeyPrefix + uriString.hashCode()
             if (pos > 5000L && (len <= 0L || pos < len - 5000L)) {
                 prefs.edit().putLong(key, pos).apply()
             } else {
@@ -265,8 +327,7 @@ class VideoPlayerActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        val uriStr = intent.getStringExtra("VIDEO_URI")
-        if (uriStr != null) saveResumePosition(uriStr)
+        saveCurrentResumePosition()
         if (!isBackgroundAudioMode && !isInPictureInPictureMode) {
             mediaPlayer.pause()
         }
@@ -289,9 +350,13 @@ class VideoPlayerActivity : ComponentActivity() {
 fun VlcStylePlayerScreen(
     mediaPlayer: MediaPlayer,
     videoTitle: String,
+    videoIndex: Int,
+    hasMultipleVideos: Boolean,
     savedResumePos: Long,
     isPipMode: Boolean,
     onBack: () -> Unit,
+    onPrevVideo: () -> Unit,
+    onNextVideo: () -> Unit,
     onPickSubtitle: () -> Unit,
     onEnterPip: () -> Unit,
     onPlayAsAudio: () -> Unit,
@@ -310,7 +375,7 @@ fun VlcStylePlayerScreen(
     var overlayText by remember { mutableStateOf("") }
     var zoomMode by remember { mutableIntStateOf(0) }
     var currentVolume by remember { mutableIntStateOf(mediaPlayer.volume.coerceIn(0, 100)) }
-    var resumeApplied by remember { mutableStateOf(false) }
+    var resumeApplied by remember(videoIndex) { mutableStateOf(false) }
 
     val speedSteps = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     var speedIdx by remember { mutableIntStateOf(2) }
@@ -335,7 +400,7 @@ fun VlcStylePlayerScreen(
         }
     }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(videoIndex, savedResumePos) {
         while (true) {
             isPlaying = mediaPlayer.isPlaying
             val t = mediaPlayer.time
@@ -495,34 +560,52 @@ fun VlcStylePlayerScreen(
                         )
                     )
 
+                    // সমান দূরত্বে সাজানো কন্ট্রোল বাটন (Prev / Next ভিডিওসহ)
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row {
-                            IconButton(onClick = onSelectTracks, modifier = Modifier.size(34.dp)) {
-                                Icon(Icons.Rounded.Subtitles, contentDescription = "Tracks", tint = Color.White, modifier = Modifier.size(19.dp))
-                            }
-                            IconButton(onClick = {
-                                zoomMode = (zoomMode + 1) % 3
-                                when (zoomMode) {
-                                    0 -> {
-                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT)
-                                        overlayText = "Best Fit"
-                                    }
-                                    1 -> {
-                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN)
-                                        overlayText = "Fit Screen"
-                                    }
-                                    2 -> {
-                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9)
-                                        overlayText = "16:9"
-                                    }
+                        IconButton(onClick = onSelectTracks, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Rounded.Subtitles, contentDescription = "Tracks", tint = Color.White, modifier = Modifier.size(20.dp))
+                        }
+                        IconButton(onClick = {
+                            zoomMode = (zoomMode + 1) % 4
+                            when (zoomMode) {
+                                0 -> {
+                                    mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT)
+                                    overlayText = "Best Fit"
                                 }
-                            }, modifier = Modifier.size(34.dp)) {
-                                Icon(Icons.Rounded.AspectRatio, contentDescription = "Zoom", tint = Color.White, modifier = Modifier.size(19.dp))
+                                1 -> {
+                                    mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN)
+                                    overlayText = "Fit Screen"
+                                }
+                                2 -> {
+                                    mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FILL)
+                                    overlayText = "Full Screen (Fill)"
+                                }
+                                3 -> {
+                                    mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9)
+                                    overlayText = "16:9"
+                                }
                             }
+                        }, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Rounded.AspectRatio, contentDescription = "Zoom", tint = Color.White, modifier = Modifier.size(20.dp))
+                        }
+
+                        IconButton(
+                            onClick = onPrevVideo,
+                            enabled = hasMultipleVideos,
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                Icons.Rounded.SkipPrevious,
+                                contentDescription = "Previous Video",
+                                tint = if (hasMultipleVideos) Color.White else Color.Gray,
+                                modifier = Modifier.size(26.dp)
+                            )
                         }
 
                         IconButton(
@@ -535,33 +618,44 @@ fun VlcStylePlayerScreen(
                                     isPlaying = true
                                 }
                             },
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(44.dp)
                         ) {
                             Icon(
                                 imageVector = if (isPlaying) Icons.Rounded.PauseCircleOutline else Icons.Rounded.PlayCircleOutline,
                                 contentDescription = "Play/Pause",
                                 tint = Color.White,
-                                modifier = Modifier.size(36.dp)
+                                modifier = Modifier.size(40.dp)
                             )
                         }
 
-                        Row {
-                            IconButton(onClick = {
-                                val act = context as ComponentActivity
-                                val isNowLandscape = act.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-                                if (isNowLandscape) {
-                                    act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                                    overlayText = "Portrait"
-                                } else {
-                                    act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-                                    overlayText = "Landscape"
-                                }
-                            }, modifier = Modifier.size(34.dp)) {
-                                Icon(Icons.Rounded.ScreenRotation, contentDescription = "Rotate", tint = Color.White, modifier = Modifier.size(19.dp))
+                        IconButton(
+                            onClick = onNextVideo,
+                            enabled = hasMultipleVideos,
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                Icons.Rounded.SkipNext,
+                                contentDescription = "Next Video",
+                                tint = if (hasMultipleVideos) Color.White else Color.Gray,
+                                modifier = Modifier.size(26.dp)
+                            )
+                        }
+
+                        IconButton(onClick = {
+                            val act = context as ComponentActivity
+                            val isNowLandscape = act.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                            if (isNowLandscape) {
+                                act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                overlayText = "Portrait"
+                            } else {
+                                act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                                overlayText = "Landscape"
                             }
-                            IconButton(onClick = { showSideMenu = !showSideMenu }, modifier = Modifier.size(34.dp)) {
-                                Icon(Icons.Rounded.MoreHoriz, contentDescription = "More", tint = Color.White, modifier = Modifier.size(19.dp))
-                            }
+                        }, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Rounded.ScreenRotation, contentDescription = "Rotate", tint = Color.White, modifier = Modifier.size(20.dp))
+                        }
+                        IconButton(onClick = { showSideMenu = !showSideMenu }, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Rounded.MoreHoriz, contentDescription = "More", tint = Color.White, modifier = Modifier.size(20.dp))
                         }
                     }
                 }
