@@ -4,14 +4,24 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.PictureInPictureParams
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.AudioManager
+import android.media.MediaMetadataRetriever
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.CountDownTimer
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Rational
 import android.view.View
@@ -30,8 +40,10 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -48,6 +60,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
@@ -63,12 +78,17 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlin.math.abs
 
 class YouTubeJsBridge(private val onPlayingChanged: (Boolean) -> Unit) {
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     @JavascriptInterface
     fun reportPlaying(playing: Boolean) {
-        onPlayingChanged(playing)
+        mainHandler.post { onPlayingChanged(playing) }
     }
 }
 
@@ -186,22 +206,11 @@ class MainActivity : ComponentActivity() {
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         if (selectedTab == 0 && isYouTubePlaying && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            activeWebView?.onResume()
+            activeWebView?.resumeTimers()
             activeWebView?.evaluateJavascript(
-                """
-                (function() {
-                    var s = document.getElementById('ultra-pip-css');
-                    if (!s) {
-                        s = document.createElement('style');
-                        s.id = 'ultra-pip-css';
-                        s.innerHTML = 'html, body { background: #000 !important; overflow: hidden !important; } ' +
-                            'ytm-mobile-topbar-renderer, .watch-below-the-player, ytm-pivot-bar-renderer, .related-items-container { display: none !important; } ' +
-                            '#player-container-id, .player-container, .html5-video-player, .video-stream, video { position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; z-index: 2147483647 !important; background: #000 !important; object-fit: contain !important; opacity: 1 !important; visibility: visible !important; }';
-                        document.head.appendChild(s);
-                    }
-                    var v = document.querySelector('video');
-                    if (v && v.paused) { v.play().catch(function(){}); }
-                })();
-                """.trimIndent(), null
+                "var v = document.querySelector('video'); if (v && v.paused) { v.play().catch(function(){}); }",
+                null
             )
             try {
                 enterPictureInPictureMode(
@@ -217,11 +226,24 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         isPipMode = isInPictureInPictureMode
-        if (!isInPictureInPictureMode) {
+        activeWebView?.onResume()
+        activeWebView?.resumeTimers()
+        if (isInPictureInPictureMode) {
             activeWebView?.evaluateJavascript(
-                "var s = document.getElementById('ultra-pip-css'); if (s) s.remove();",
-                null
+                """
+                (function() {
+                    var v = document.querySelector('video');
+                    if (v) {
+                        v.muted = false;
+                        if (v.paused) v.play().catch(function(){});
+                    }
+                    var fsBtn = document.querySelector('button.fullscreen-icon, [aria-label*="Full screen"], [aria-label*="full screen"]');
+                    if (fsBtn && !document.fullscreenElement) { fsBtn.click(); }
+                })();
+                """.trimIndent(), null
             )
+        } else {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         }
     }
 
@@ -265,27 +287,145 @@ fun MainAppContainer(
         permissionLauncher.launch(perms.toTypedArray())
     }
 
+    // YouTube ফুলস্ক্রিন ভিউ + স্ক্রিন লক ও ব্রাইটনেস/ভলিউম গেসচার
     if (fullscreenView != null) {
-        BackHandler { onHideFullscreen() }
-        AndroidView(
-            modifier = Modifier.fillMaxSize().background(Color.Black),
-            factory = { ctx ->
-                FrameLayout(ctx).apply {
-                    (fullscreenView.parent as? ViewGroup)?.removeView(fullscreenView)
-                    addView(
-                        fullscreenView,
-                        FrameLayout.LayoutParams(
-                            FrameLayout.LayoutParams.MATCH_PARENT,
-                            FrameLayout.LayoutParams.MATCH_PARENT
+        var ytLocked by remember { mutableStateOf(false) }
+        var gestureHud by remember { mutableStateOf("") }
+        var showFsBar by remember { mutableStateOf(true) }
+        val audioManager = remember { activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+
+        LaunchedEffect(showFsBar) {
+            if (showFsBar) {
+                delay(3500)
+                showFsBar = false
+            }
+        }
+
+        BackHandler {
+            if (!ytLocked) onHideFullscreen()
+            else Toast.makeText(activity, "স্ক্রিন আনলক করুন", Toast.LENGTH_SHORT).show()
+        }
+
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    FrameLayout(ctx).apply {
+                        (fullscreenView.parent as? ViewGroup)?.removeView(fullscreenView)
+                        addView(
+                            fullscreenView,
+                            FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                FrameLayout.LayoutParams.MATCH_PARENT
+                            )
                         )
+                    }
+                }
+            )
+
+            // লক করা থাকলে বা গেসচার সক্রিয় থাকলে কন্ট্রোল লেয়ার
+            if (ytLocked) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(Unit) {
+                            detectDragGestures { _, _ -> }
+                        }
+                ) {
+                    IconButton(
+                        onClick = { ytLocked = false; showFsBar = true },
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .safeDrawingPadding()
+                            .padding(14.dp)
+                            .background(Color(0x99000000), CircleShape)
+                    ) {
+                        Icon(Icons.Rounded.Lock, contentDescription = "Unlock", tint = Color(0xFFFFC107))
+                    }
+                }
+            } else {
+                // বাম-ডান edge-এর ওপর ব্রাইটনেস/ভলিউম সোয়াইপ জোন (YouTube-এর নিজস্ব ট্যাপ নষ্ট না করে)
+                Row(modifier = Modifier.fillMaxSize()) {
+                    Box(
+                        modifier = Modifier
+                            .weight(0.22f)
+                            .fillMaxHeight()
+                            .pointerInput(Unit) {
+                                detectDragGestures { change, dragAmount ->
+                                    if (abs(dragAmount.y) > abs(dragAmount.x)) {
+                                        change.consume()
+                                        val lp = activity.window.attributes
+                                        val cur = if (lp.screenBrightness < 0) 0.5f else lp.screenBrightness
+                                        val next = (cur + (-dragAmount.y / size.height)).coerceIn(0.05f, 1.0f)
+                                        lp.screenBrightness = next
+                                        activity.window.attributes = lp
+                                        gestureHud = "Brightness: ${(next * 100).toInt()}%"
+                                    }
+                                }
+                            }
+                    )
+                    Spacer(modifier = Modifier.weight(0.56f))
+                    Box(
+                        modifier = Modifier
+                            .weight(0.22f)
+                            .fillMaxHeight()
+                            .pointerInput(Unit) {
+                                detectDragGestures { change, dragAmount ->
+                                    if (abs(dragAmount.y) > abs(dragAmount.x)) {
+                                        change.consume()
+                                        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                        val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                        val step = if (dragAmount.y < 0) 1 else -1
+                                        val nextVol = (curVol + step).coerceIn(0, maxVol)
+                                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, nextVol, 0)
+                                        gestureHud = "Volume: ${(nextVol * 100) / maxVol}%"
+                                    }
+                                }
+                            }
                     )
                 }
+
+                // স্ক্রিন লক ও এক্সিট বাটন
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .safeDrawingPadding()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    IconButton(
+                        onClick = { ytLocked = true },
+                        modifier = Modifier.size(38.dp).background(Color(0x88000000), CircleShape)
+                    ) {
+                        Icon(Icons.Rounded.LockOpen, contentDescription = "Lock Screen", tint = Color.White, modifier = Modifier.size(20.dp))
+                    }
+                    IconButton(
+                        onClick = { onHideFullscreen() },
+                        modifier = Modifier.size(38.dp).background(Color(0x88000000), CircleShape)
+                    ) {
+                        Icon(Icons.Rounded.FullscreenExit, contentDescription = "Exit Fullscreen", tint = Color.White, modifier = Modifier.size(22.dp))
+                    }
+                }
             }
-        )
+
+            if (gestureHud.isNotEmpty()) {
+                LaunchedEffect(gestureHud) {
+                    delay(1000)
+                    gestureHud = ""
+                }
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .background(Color(0xAA000000), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                ) {
+                    Text(gestureHud, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                }
+            }
+        }
         return
     }
 
-    // YouTube-এ ব্যাক চাপলে আগে ভেতরে পেছনে যাবে, তারপর ডাবল-ব্যাক এক্সিট
     BackHandler(enabled = !isMusicFullPlayerOpen) {
         if (selectedTab == 0) {
             val wv = activity.activeWebView
@@ -371,7 +511,7 @@ fun MainAppContainer(
                     Modifier
                         .fillMaxSize()
                         .background(Color.Black)
-                        .then(if (!isPipMode) Modifier.statusBarsPadding().padding(bottom = padding.calculateBottomPadding()) else Modifier)
+                        .then(if (!isPipMode) Modifier.padding(bottom = padding.calculateBottomPadding()) else Modifier)
                 } else {
                     Modifier.size(0.dp)
                 }
@@ -435,6 +575,9 @@ fun YouTubeTabScreen(
     onShowFullscreen: (View, WebChromeClient.CustomViewCallback) -> Unit,
     onHideFullscreen: () -> Unit
 ) {
+    val context = LocalContext.current
+    var currentUrl by remember { mutableStateOf("https://m.youtube.com") }
+
     val bgScript = """
         (function() {
             try {
@@ -467,777 +610,53 @@ fun YouTubeTabScreen(
         })();
     """.trimIndent()
 
-    AndroidView(
-        modifier = Modifier.fillMaxSize(),
-        update = { webView ->
-            webView.visibility = if (isVisible) View.VISIBLE else View.GONE
-        },
-        factory = { ctx ->
-            val webView = BackgroundWebView(ctx)
-            activity.activeWebView = webView
-            webView.addJavascriptInterface(
-                YouTubeJsBridge { playing -> activity.isYouTubePlaying = playing },
-                "UltraBridge"
-            )
-
-            val cookieManager = CookieManager.getInstance()
-            cookieManager.setAcceptCookie(true)
-            cookieManager.setAcceptThirdPartyCookies(webView, true)
-
-            webView.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                mediaPlaybackRequiresUserGesture = false
-                cacheMode = WebSettings.LOAD_DEFAULT
-                useWideViewPort = true
-                loadWithOverviewMode = true
-            }
-
-            webView.webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                    val url = request?.url?.toString() ?: return false
-                    if (!url.startsWith("http://") && !url.startsWith("https://")) return true
-                    return false
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    view?.evaluateJavascript(bgScript, null)
-                }
-
-                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
-                    super.doUpdateVisitedHistory(view, url, isReload)
-                    view?.evaluateJavascript(bgScript, null)
-                }
-            }
-
-            webView.webChromeClient = object : WebChromeClient() {
-                override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
-                    if (view != null && callback != null) onShowFullscreen(view, callback)
-                }
-
-                override fun onHideCustomView() {
-                    onHideFullscreen()
-                }
-            }
-
-            webView.loadUrl("https://m.youtube.com")
-            webView
-        }
-    )
-}
-
-@Composable
-fun VideoListTabScreen() {
-    val context = LocalContext.current
-    val activity = context as Activity
-    var videos by remember { mutableStateOf<List<MediaFile>>(emptyList()) }
-    var refreshKey by remember { mutableIntStateOf(0) }
-
-    var deleteTarget by remember { mutableStateOf<MediaFile?>(null) }
-    var renameTarget by remember { mutableStateOf<MediaFile?>(null) }
-    var renameInput by remember { mutableStateOf("") }
-    var pendingRenameAfterPerm by remember { mutableStateOf<Pair<MediaFile, String>?>(null) }
-
-    val deleteLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartIntentSenderForResult()
-    ) { if (it.resultCode == Activity.RESULT_OK) refreshKey++ }
-
-    val writeLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartIntentSenderForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            pendingRenameAfterPerm?.let { (file, name) ->
-                try {
-                    val values = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                    }
-                    activity.contentResolver.update(file.uri, values, null, null)
-                } catch (_: Exception) { }
-            }
-            refreshKey++
-        }
-        pendingRenameAfterPerm = null
-    }
-
-    LaunchedEffect(refreshKey) {
-        MediaScanner.observeMediaChanges(context, true).collect {
-            videos = MediaScanner.scanVideos(context)
-        }
-    }
-
-    LazyColumn(modifier = Modifier.fillMaxSize()) {
-        itemsIndexed(videos, key = { _, item -> item.id }) { index, video ->
-            var menuExpanded by remember { mutableStateOf(false) }
-            ListItem(
-                modifier = Modifier.clickable {
-                    val intent = Intent(context, VideoPlayerActivity::class.java).apply {
-                        putExtra("VIDEO_URI", video.uri.toString())
-                        putExtra("VIDEO_TITLE", video.title)
-                    }
-                    context.startActivity(intent)
-                },
-                leadingContent = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("${index + 1}.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Icon(Icons.Rounded.Movie, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                    }
-                },
-                headlineContent = { Text(video.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                supportingContent = { Text("${formatMillis(video.duration)} • ${video.sizeMb} MB") },
-                trailingContent = {
-                    Box {
-                        IconButton(onClick = { menuExpanded = true }) {
-                            Icon(Icons.Rounded.MoreVert, contentDescription = "Options")
-                        }
-                        DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                            DropdownMenuItem(
-                                text = { Text("Rename") },
-                                leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
-                                onClick = {
-                                    menuExpanded = false
-                                    renameTarget = video
-                                    renameInput = video.title
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Delete", color = Color.Red) },
-                                leadingIcon = { Icon(Icons.Rounded.DeleteOutline, contentDescription = null, tint = Color.Red) },
-                                onClick = {
-                                    menuExpanded = false
-                                    deleteTarget = video
-                                }
-                            )
-                        }
-                    }
-                }
-            )
-            HorizontalDivider(thickness = 0.5.dp)
-        }
-    }
-
-    deleteTarget?.let { target ->
-        AlertDialog(
-            onDismissRequest = { deleteTarget = null },
-            title = { Text("ভিডিও ডিলিট করবেন?") },
-            text = { Text("আপনি কি নিশ্চিতভাবে \"${target.title}\" ফাইলটি স্থায়ীভাবে মুছে ফেলতে চান?") },
-            confirmButton = {
-                TextButton(onClick = {
-                    deleteTarget = null
-                    MediaScanner.deleteFile(activity, target.uri, deleteLauncher) { refreshKey++ }
-                }) { Text("Delete", color = Color.Red) }
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            update = { webView ->
+                webView.visibility = if (isVisible) View.VISIBLE else View.GONE
             },
-            dismissButton = {
-                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
-            }
-        )
-    }
-
-    renameTarget?.let { target ->
-        AlertDialog(
-            onDismissRequest = { renameTarget = null },
-            title = { Text("Rename Video") },
-            text = {
-                OutlinedTextField(
-                    value = renameInput,
-                    onValueChange = { renameInput = it },
-                    singleLine = true,
-                    label = { Text("নতুন নাম") }
+            factory = { ctx ->
+                val webView = BackgroundWebView(ctx)
+                activity.activeWebView = webView
+                webView.addJavascriptInterface(
+                    YouTubeJsBridge { playing -> activity.isYouTubePlaying = playing },
+                    "UltraBridge"
                 )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val newName = renameInput.trim()
-                    renameTarget = null
-                    if (newName.isNotEmpty()) {
-                        pendingRenameAfterPerm = target to newName
-                        MediaScanner.renameFile(activity, target.uri, newName, writeLauncher) {
-                            pendingRenameAfterPerm = null
-                            refreshKey++
-                        }
-                    }
-                }) { Text("Save") }
-            },
-            dismissButton = {
-                TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
-            }
-        )
-    }
-}
 
-@Composable
-fun MuzioMusicTabScreen(
-    isDarkTheme: Boolean,
-    currentSong: MediaFile?,
-    onSongChanged: (MediaFile?) -> Unit,
-    onFullPlayerChanged: (Boolean) -> Unit
-) {
-    val context = LocalContext.current
-    val activity = context as Activity
-    val prefs = remember { context.getSharedPreferences("muzio_favs", Context.MODE_PRIVATE) }
+                val cookieManager = CookieManager.getInstance()
+                cookieManager.setAcceptCookie(true)
+                cookieManager.setAcceptThirdPartyCookies(webView, true)
 
-    var songs by remember { mutableStateOf<List<MediaFile>>(emptyList()) }
-    var searchQuery by remember { mutableStateOf("") }
-    var selectedCategory by remember { mutableIntStateOf(0) }
-    var refreshKey by remember { mutableIntStateOf(0) }
-    var favoriteIds by remember {
-        mutableStateOf(prefs.getStringSet("fav_ids", emptySet())?.toSet() ?: emptySet())
-    }
-
-    var mediaController by remember { mutableStateOf<MediaController?>(null) }
-    var isPlaying by remember { mutableStateOf(false) }
-    var currentPos by remember { mutableLongStateOf(0L) }
-    var totalDur by remember { mutableLongStateOf(1L) }
-    var repeatMode by remember { mutableIntStateOf(Player.REPEAT_MODE_OFF) }
-    var shuffleEnabled by remember { mutableStateOf(false) }
-
-    var showFullPlayer by remember { mutableStateOf(false) }
-    var showEqualizer by remember { mutableStateOf(false) }
-    var showQueueDialog by remember { mutableStateOf(false) }
-
-    var deleteTarget by remember { mutableStateOf<MediaFile?>(null) }
-    var renameTarget by remember { mutableStateOf<MediaFile?>(null) }
-    var renameInput by remember { mutableStateOf("") }
-    var pendingRenameAfterPerm by remember { mutableStateOf<Pair<MediaFile, String>?>(null) }
-
-    LaunchedEffect(showFullPlayer) { onFullPlayerChanged(showFullPlayer) }
-    DisposableEffect(Unit) { onDispose { onFullPlayerChanged(false) } }
-
-    val deleteLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartIntentSenderForResult()
-    ) { if (it.resultCode == Activity.RESULT_OK) refreshKey++ }
-
-    val writeLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartIntentSenderForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            pendingRenameAfterPerm?.let { (file, name) ->
-                try {
-                    val values = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                    }
-                    activity.contentResolver.update(file.uri, values, null, null)
-                } catch (_: Exception) { }
-            }
-            refreshKey++
-        }
-        pendingRenameAfterPerm = null
-    }
-
-    DisposableEffect(Unit) {
-        val token = SessionToken(context, ComponentName(context, MusicPlaybackService::class.java))
-        val future = MediaController.Builder(context, token).buildAsync()
-        future.addListener({ mediaController = future.get() }, ContextCompat.getMainExecutor(context))
-        onDispose { mediaController?.release() }
-    }
-
-    LaunchedEffect(refreshKey) {
-        MediaScanner.observeMediaChanges(context, false).collect {
-            songs = MediaScanner.scanAudio(context)
-        }
-    }
-
-    LaunchedEffect(mediaController) {
-        while (true) {
-            mediaController?.let { ctrl ->
-                isPlaying = ctrl.isPlaying
-                currentPos = ctrl.currentPosition.coerceAtLeast(0L)
-                totalDur = ctrl.duration.coerceAtLeast(1L)
-            }
-            delay(400)
-        }
-    }
-
-    fun playSong(song: MediaFile) {
-        onSongChanged(song)
-        mediaController?.apply {
-            setMediaItem(MediaItem.fromUri(song.uri))
-            prepare()
-            play()
-        }
-    }
-
-    fun stopAndDismissMiniPlayer() {
-        mediaController?.stop()
-        onSongChanged(null)
-        showFullPlayer = false
-    }
-
-    fun toggleFavorite(songId: Long) {
-        val idStr = songId.toString()
-        val updated = if (favoriteIds.contains(idStr)) favoriteIds - idStr else favoriteIds + idStr
-        favoriteIds = updated
-        prefs.edit().putStringSet("fav_ids", updated).apply()
-    }
-
-    val displayedSongs = remember(songs, searchQuery, selectedCategory, favoriteIds) {
-        val base = when (selectedCategory) {
-            1 -> songs.filter { favoriteIds.contains(it.id.toString()) }
-            2 -> songs.sortedBy { it.artist.lowercase() }
-            3 -> songs.sortedBy { it.album.lowercase() }
-            else -> songs
-        }
-        if (searchQuery.isBlank()) base
-        else base.filter {
-            it.title.contains(searchQuery, ignoreCase = true) ||
-                it.artist.contains(searchQuery, ignoreCase = true)
-        }
-    }
-
-    val bgBrush = if (isDarkTheme) {
-        Brush.verticalGradient(listOf(Color(0xFF2B1212), Color(0xFF120B0B)))
-    } else {
-        Brush.verticalGradient(listOf(Color(0xFFFAFAFA), Color(0xFFF0ECEC)))
-    }
-    val titleColor = if (isDarkTheme) Color.White else Color(0xFF1A1A1A)
-    val subColor = if (isDarkTheme) Color.LightGray else Color(0xFF666666)
-    val accentColor = if (isDarkTheme) Color(0xFFFFC107) else Color(0xFFD32F2F)
-    val iconBoxColor = if (isDarkTheme) Color(0xFF3A2424) else Color(0xFFEDE2E2)
-    val miniPlayerBg = if (isDarkTheme) Color(0xFF261717) else Color(0xFFEAE3E3)
-
-    Box(modifier = Modifier.fillMaxSize().background(bgBrush)) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            val tabs = listOf("Songs", "Favorites", "Artists", "Albums")
-            TabRow(
-                selectedTabIndex = selectedCategory,
-                containerColor = Color.Transparent,
-                contentColor = accentColor
-            ) {
-                tabs.forEachIndexed { idx, title ->
-                    Tab(
-                        selected = selectedCategory == idx,
-                        onClick = { selectedCategory = idx },
-                        text = {
-                            Text(
-                                title,
-                                fontSize = 13.sp,
-                                color = if (selectedCategory == idx) accentColor else subColor
-                            )
-                        }
-                    )
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    mediaPlaybackRequiresUserGesture = false
+                    cacheMode = WebSettings.LOAD_DEFAULT
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
                 }
-            }
 
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = { searchQuery = it },
-                placeholder = { Text("Search ${displayedSongs.size} songs...", color = subColor) },
-                leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, tint = accentColor) },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = titleColor,
-                    unfocusedTextColor = titleColor,
-                    focusedBorderColor = accentColor,
-                    unfocusedBorderColor = subColor.copy(alpha = 0.5f)
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                singleLine = true,
-                shape = RoundedCornerShape(24.dp)
-            )
+                webView.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                        val url = request?.url?.toString() ?: return false
+                        if (!url.startsWith("http://") && !url.startsWith("https://")) return true
+                        return false
+                    }
 
-            if (displayedSongs.isEmpty()) {
-                Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Text(
-                        if (selectedCategory == 1) "কোনো Favorite গান নেই" else "কোনো অডিও পাওয়া যায়নি",
-                        color = subColor,
-                        fontSize = 14.sp
-                    )
-                }
-            } else {
-                LazyColumn(
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(bottom = 90.dp)
-                ) {
-                    itemsIndexed(displayedSongs, key = { _, item -> item.id }) { index, song ->
-                        var menuExpanded by remember { mutableStateOf(false) }
-                        ListItem(
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                            modifier = Modifier.clickable { playSong(song) },
-                            leadingContent = {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text("${index + 1}.", color = subColor, fontSize = 12.sp)
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Box(
-                                        modifier = Modifier
-                                            .size(42.dp)
-                                            .clip(RoundedCornerShape(8.dp))
-                                            .background(iconBoxColor),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = accentColor)
-                                    }
-                                }
-                            },
-                            headlineContent = {
-                                Text(song.title, color = titleColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            },
-                            supportingContent = {
-                                val sub = if (selectedCategory == 3) "${song.album} • ${formatMillis(song.duration)}"
-                                else "${song.artist} • ${formatMillis(song.duration)}"
-                                Text(sub, color = subColor, fontSize = 12.sp, maxLines = 1)
-                            },
-                            trailingContent = {
-                                Box {
-                                    IconButton(onClick = { menuExpanded = true }) {
-                                        Icon(Icons.Rounded.MoreVert, contentDescription = "Options", tint = subColor)
-                                    }
-                                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                                        DropdownMenuItem(
-                                            text = { Text(if (favoriteIds.contains(song.id.toString())) "Remove Favorite" else "Add to Favorites") },
-                                            leadingIcon = { Icon(Icons.Rounded.Favorite, contentDescription = null) },
-                                            onClick = { menuExpanded = false; toggleFavorite(song.id) }
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("Rename") },
-                                            leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
-                                            onClick = {
-                                                menuExpanded = false
-                                                renameTarget = song
-                                                renameInput = song.title
-                                            }
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("Delete", color = Color.Red) },
-                                            leadingIcon = { Icon(Icons.Rounded.DeleteOutline, contentDescription = null, tint = Color.Red) },
-                                            onClick = {
-                                                menuExpanded = false
-                                                deleteTarget = song
-                                            }
-                                        )
-                                    }
-                                }
-                            }
-                        )
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        if (url != null) currentUrl = url
+                        view?.evaluateJavascript(bgScript, null)
+                    }
+
+                    override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                        super.doUpdateVisitedHistory(view, url, isReload)
+                        if (url != null) currentUrl = url
+                        view?.evaluateJavascript(bgScript, null)
                     }
                 }
-            }
-        }
 
-        FloatingActionButton(
-            onClick = {
-                if (displayedSongs.isNotEmpty()) {
-                    val pool = if (displayedSongs.size > 1 && currentSong != null) {
-                        displayedSongs.filter { it.id != currentSong.id }
-                    } else displayedSongs
-                    playSong(pool.random())
-                }
-            },
-            containerColor = accentColor,
-            contentColor = if (isDarkTheme) Color.Black else Color.White,
-            shape = CircleShape,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 20.dp, bottom = if (currentSong != null) 78.dp else 20.dp)
-        ) {
-            Icon(Icons.Rounded.Shuffle, contentDescription = "Shuffle")
-        }
-
-        // মিনি-প্লেয়ার বার (Close × বাটনসহ)
-        currentSong?.let { song ->
-            Row(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .background(miniPlayerBg)
-                    .clickable { showFullPlayer = true }
-                    .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(Icons.Rounded.Album, contentDescription = null, tint = accentColor, modifier = Modifier.size(32.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(song.title, color = titleColor, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                    Text(song.artist, color = subColor, fontSize = 11.sp, maxLines = 1)
-                }
-                IconButton(onClick = {
-                    if (isPlaying) mediaController?.pause() else mediaController?.play()
-                }, modifier = Modifier.size(36.dp)) {
-                    Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, contentDescription = "Play", tint = titleColor)
-                }
-                IconButton(onClick = { showEqualizer = true }, modifier = Modifier.size(36.dp)) {
-                    Icon(Icons.Rounded.Equalizer, contentDescription = "EQ", tint = accentColor)
-                }
-                IconButton(onClick = { stopAndDismissMiniPlayer() }, modifier = Modifier.size(36.dp)) {
-                    Icon(Icons.Rounded.Close, contentDescription = "Close Player", tint = subColor)
-                }
-            }
-        }
-
-        if (showFullPlayer && currentSong != null) {
-            BackHandler { showFullPlayer = false }
-            val song = currentSong
-            val isFav = favoriteIds.contains(song.id.toString())
-
-            Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF7A6348)) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .statusBarsPadding()
-                        .navigationBarsPadding()
-                        .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { showFullPlayer = false }) {
-                            Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "Close", tint = Color.White)
-                        }
-                        Text("Now Playing", color = Color.White, fontWeight = FontWeight.Medium)
-                        IconButton(onClick = { showEqualizer = true }) {
-                            Icon(Icons.Rounded.Equalizer, contentDescription = "Equalizer", tint = Color(0xFFFFC107))
-                        }
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .size(230.dp)
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color(0xFF4A3B2A)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = Color(0xFFFFC107), modifier = Modifier.size(96.dp))
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(onClick = { toggleFavorite(song.id) }) {
-                            Icon(
-                                if (isFav) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                                contentDescription = "Favorite",
-                                tint = if (isFav) Color(0xFFFF5252) else Color.White
-                            )
-                        }
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
-                            Text(song.title, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(song.artist, color = Color.LightGray, fontSize = 13.sp, maxLines = 1)
-                        }
-                        IconButton(onClick = { showQueueDialog = true }) {
-                            Icon(Icons.Rounded.QueueMusic, contentDescription = "Playlist Queue", tint = Color.White)
-                        }
-                    }
-
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Slider(
-                            value = (currentPos.toFloat() / totalDur.toFloat()).coerceIn(0f, 1f),
-                            onValueChange = {
-                                val target = (it * totalDur).toLong()
-                                currentPos = target
-                                mediaController?.seekTo(target)
-                            },
-                            colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = Color.White)
-                        )
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(formatMillis(currentPos), color = Color.White, fontSize = 12.sp)
-                            Text(formatMillis(totalDur), color = Color.White, fontSize = 12.sp)
-                        }
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(onClick = {
-                            repeatMode = when (repeatMode) {
-                                Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ONE
-                                Player.REPEAT_MODE_ONE -> Player.REPEAT_MODE_ALL
-                                else -> Player.REPEAT_MODE_OFF
-                            }
-                            mediaController?.repeatMode = repeatMode
-                        }) {
-                            Icon(
-                                if (repeatMode == Player.REPEAT_MODE_ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
-                                contentDescription = "Repeat",
-                                tint = if (repeatMode != Player.REPEAT_MODE_OFF) Color(0xFFFFC107) else Color.White
-                            )
-                        }
-
-                        IconButton(onClick = {
-                            if (displayedSongs.isNotEmpty()) {
-                                val idx = displayedSongs.indexOfFirst { it.id == song.id }
-                                val prev = if (idx > 0) displayedSongs[idx - 1] else displayedSongs.last()
-                                playSong(prev)
-                            }
-                        }) {
-                            Icon(Icons.Rounded.SkipPrevious, contentDescription = "Prev", tint = Color.White, modifier = Modifier.size(34.dp))
-                        }
-
-                        IconButton(
-                            onClick = { if (isPlaying) mediaController?.pause() else mediaController?.play() },
-                            modifier = Modifier.size(64.dp).background(Color(0x44FFFFFF), CircleShape)
-                        ) {
-                            Icon(
-                                if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                contentDescription = "Play/Pause",
-                                tint = Color.White,
-                                modifier = Modifier.size(38.dp)
-                            )
-                        }
-
-                        IconButton(onClick = {
-                            if (displayedSongs.isNotEmpty()) {
-                                val next = if (shuffleEnabled) displayedSongs.random() else {
-                                    val idx = displayedSongs.indexOfFirst { it.id == song.id }
-                                    displayedSongs[(idx + 1) % displayedSongs.size]
-                                }
-                                playSong(next)
-                            }
-                        }) {
-                            Icon(Icons.Rounded.SkipNext, contentDescription = "Next", tint = Color.White, modifier = Modifier.size(34.dp))
-                        }
-
-                        IconButton(onClick = { shuffleEnabled = !shuffleEnabled }) {
-                            Icon(
-                                Icons.Rounded.Shuffle,
-                                contentDescription = "Shuffle",
-                                tint = if (shuffleEnabled) Color(0xFFFFC107) else Color.White
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        if (showQueueDialog) {
-            AlertDialog(
-                onDismissRequest = { showQueueDialog = false },
-                title = { Text("Playing Queue (${displayedSongs.size})") },
-                text = {
-                    LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
-                        itemsIndexed(displayedSongs, key = { _, item -> item.id }) { idx, s ->
-                            Text(
-                                text = "${idx + 1}. ${s.title}",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = if (s.id == currentSong?.id) FontWeight.Bold else FontWeight.Normal,
-                                color = if (s.id == currentSong?.id) accentColor else MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        playSong(s)
-                                        showQueueDialog = false
-                                    }
-                                    .padding(vertical = 10.dp)
-                            )
-                        }
-                    }
-                },
-                confirmButton = { TextButton(onClick = { showQueueDialog = false }) { Text("Close") } }
-            )
-        }
-
-        if (showEqualizer) {
-            AlertDialog(
-                onDismissRequest = { showEqualizer = false },
-                title = { Text("Equalizer & Bass Boost") },
-                text = {
-                    val eq = MusicPlaybackService.equalizer
-                    val bass = MusicPlaybackService.bassBoost
-                    if (eq == null) {
-                        Text("ইকুলাইজার সক্রিয় করতে আগে যেকোনো একটি গান চালু করুন।")
-                    } else {
-                        Column(modifier = Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState())) {
-                            val presetCount = eq.numberOfPresets.toInt().coerceAtMost(5)
-                            if (presetCount > 0) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    for (p in 0 until presetCount) {
-                                        val name = eq.getPresetName(p.toShort())
-                                        AssistChip(
-                                            onClick = {
-                                                eq.usePreset(p.toShort())
-                                                Toast.makeText(context, "Preset: $name", Toast.LENGTH_SHORT).show()
-                                            },
-                                            label = { Text(name, fontSize = 10.sp) }
-                                        )
-                                    }
-                                }
-                                Spacer(modifier = Modifier.height(8.dp))
-                            }
-
-                            if (bass != null && bass.strengthSupported) {
-                                var bassStrength by remember { mutableFloatStateOf(bass.roundedStrength.toFloat()) }
-                                Text("Bass Boost (${(bassStrength / 10).toInt()}%)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                                Slider(
-                                    value = bassStrength,
-                                    valueRange = 0f..1000f,
-                                    onValueChange = {
-                                        bassStrength = it
-                                        bass.setStrength(it.toInt().toShort())
-                                    }
-                                )
-                            }
-
-                            val bands = eq.numberOfBands.toInt()
-                            val range = eq.bandLevelRange
-                            for (i in 0 until bands) {
-                                var level by remember { mutableFloatStateOf(eq.getBandLevel(i.toShort()).toFloat()) }
-                                Text("${eq.getCenterFreq(i.toShort()) / 1000} Hz", fontSize = 12.sp)
-                                Slider(
-                                    value = level,
-                                    valueRange = range[0].toFloat()..range[1].toFloat(),
-                                    onValueChange = {
-                                        level = it
-                                        eq.setBandLevel(i.toShort(), it.toInt().toShort())
-                                    }
-                                )
-                            }
-                        }
-                    }
-                },
-                confirmButton = { TextButton(onClick = { showEqualizer = false }) { Text("Done") } }
-            )
-        }
-
-        deleteTarget?.let { target ->
-            AlertDialog(
-                onDismissRequest = { deleteTarget = null },
-                title = { Text("অডিও ডিলিট করবেন?") },
-                text = { Text("আপনি কি নিশ্চিতভাবে \"${target.title}\" ফাইলটি স্থায়ীভাবে মুছে ফেলতে চান?") },
-                confirmButton = {
-                    TextButton(onClick = {
-                        deleteTarget = null
-                        MediaScanner.deleteFile(activity, target.uri, deleteLauncher) { refreshKey++ }
-                    }) { Text("Delete", color = Color.Red) }
-                },
-                dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } }
-            )
-        }
-
-        renameTarget?.let { target ->
-            AlertDialog(
-                onDismissRequest = { renameTarget = null },
-                title = { Text("Rename Audio") },
-                text = {
-                    OutlinedTextField(
-                        value = renameInput,
-                        onValueChange = { renameInput = it },
-                        singleLine = true,
-                        label = { Text("নতুন নাম") }
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        val newName = renameInput.trim()
-                        renameTarget = null
-                        if (newName.isNotEmpty()) {
-                            pendingRenameAfterPerm = target to newName
-                            MediaScanner.renameFile(activity, target.uri, newName, writeLauncher) {
-                                pendingRenameAfterPerm = null
-                                refreshKey++
-                            }
-                        }
-                    }) { Text("Save") }
-                },
-                dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
-            )
-        }
-    }
-}
+                webView.webChromeClient = object : WebChromeClient() {
+                    override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                        if (view != null && callback
