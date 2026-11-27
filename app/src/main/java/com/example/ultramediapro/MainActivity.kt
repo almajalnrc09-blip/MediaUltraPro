@@ -17,6 +17,7 @@ import android.util.Rational
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -48,6 +49,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -63,29 +65,58 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import kotlinx.coroutines.delay
 
+class YouTubeJsBridge(private val onPlayingChanged: (Boolean) -> Unit) {
+    @JavascriptInterface
+    fun reportPlaying(playing: Boolean) {
+        onPlayingChanged(playing)
+    }
+}
+
 class MainActivity : ComponentActivity() {
 
     private var selectedTab by mutableIntStateOf(0)
     private var isPipMode by mutableStateOf(false)
+    @Volatile var isYouTubePlaying: Boolean = false
     var activeWebView: BackgroundWebView? = null
     var customFullscreenView by mutableStateOf<View?>(null)
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         val prefs = getSharedPreferences("ultra_prefs", MODE_PRIVATE)
 
         setContent {
             var isDarkTheme by remember { mutableStateOf(prefs.getBoolean("dark_mode", true)) }
+            val view = LocalView.current
+
+            // সময়, Wi-Fi ও ব্যাটারি আইকন সব ট্যাবে স্পষ্ট দেখানোর জন্য স্ট্যাটাস বার কালার সমন্বয়
+            SideEffect {
+                val controller = WindowInsetsControllerCompat(window, view)
+                val useDarkStatusIcons = when {
+                    customFullscreenView != null -> false
+                    selectedTab == 0 -> false // YouTube ডার্ক ব্যাকগ্রাউন্ডে সাদা আইকন
+                    else -> !isDarkTheme
+                }
+                controller.isAppearanceLightStatusBars = useDarkStatusIcons
+                controller.isAppearanceLightNavigationBars = !isDarkTheme
+            }
+
             val colorScheme = if (isDarkTheme) {
                 darkColorScheme(
                     background = Color(0xFF140C0C),
-                    surface = Color(0xFF1F1414),
+                    surface = Color(0xFF1C1111),
                     primary = Color(0xFFFFC107)
                 )
             } else {
-                lightColorScheme(primary = Color(0xFFD32F2F))
+                lightColorScheme(
+                    background = Color(0xFFFAFAFA),
+                    surface = Color(0xFFFFFFFF),
+                    primary = Color(0xFFD32F2F)
+                )
             }
 
             MaterialTheme(colorScheme = colorScheme) {
@@ -100,8 +131,8 @@ class MainActivity : ComponentActivity() {
                     },
                     isPipMode = isPipMode,
                     fullscreenView = customFullscreenView,
-                    onShowFullscreen = { view, callback ->
-                        customFullscreenView = view
+                    onShowFullscreen = { fsView, callback ->
+                        customFullscreenView = fsView
                         customViewCallback = callback
                         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                         setImmersiveMode(true)
@@ -123,11 +154,9 @@ class MainActivity : ComponentActivity() {
     private fun setImmersiveMode(enable: Boolean) {
         val controller = WindowInsetsControllerCompat(window, window.decorView)
         if (enable) {
-            WindowCompat.setDecorFitsSystemWindows(window, false)
             controller.hide(WindowInsetsCompat.Type.systemBars())
             controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         } else {
-            WindowCompat.setDecorFitsSystemWindows(window, true)
             controller.show(WindowInsetsCompat.Type.systemBars())
         }
     }
@@ -141,7 +170,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        if (selectedTab == 0) {
+        // শুধু YouTube আসলেই চালু থাকলে তবেই ব্যাকগ্রাউন্ড সার্ভিস চলবে
+        if (selectedTab == 0 && isYouTubePlaying) {
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
             try {
@@ -157,29 +187,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (selectedTab == 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        // পজ করা ভিডিও কখনোই আর নিজে থেকে চালু হবে না বা PiP খুলবে না
+        if (selectedTab == 0 && isYouTubePlaying && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             activeWebView?.evaluateJavascript(
                 """
                 (function() {
-                    var v = document.querySelector('video');
-                    if (v) {
-                        v.dataset.origStyle = v.getAttribute('style') || '';
-                        v.style.position = 'fixed';
-                        v.style.top = '0';
-                        v.style.left = '0';
-                        v.style.width = '100vw';
-                        v.style.height = '100vh';
-                        v.style.zIndex = '9999999';
-                        v.style.background = '#000';
-                        v.style.objectFit = 'contain';
-                        if (v.paused && v.currentTime > 0) v.play();
+                    var s = document.getElementById('ultra-pip-css');
+                    if (!s) {
+                        s = document.createElement('style');
+                        s.id = 'ultra-pip-css';
+                        s.innerHTML = 'ytm-mobile-topbar-renderer, .watch-below-the-player, ytm-pivot-bar-renderer, .player-controls-content { display: none !important; } ' +
+                            '#player-container-id, .player-container, .html5-video-player, video { position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; z-index: 999999 !important; background: #000 !important; object-fit: contain !important; }';
+                        document.head.appendChild(s);
                     }
                 })();
                 """.trimIndent(), null
             )
-            enterPictureInPictureMode(
-                PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()
-            )
+            try {
+                enterPictureInPictureMode(
+                    PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()
+                )
+            } catch (_: Exception) { }
         }
     }
 
@@ -191,14 +219,8 @@ class MainActivity : ComponentActivity() {
         isPipMode = isInPictureInPictureMode
         if (!isInPictureInPictureMode) {
             activeWebView?.evaluateJavascript(
-                """
-                (function() {
-                    var v = document.querySelector('video');
-                    if (v && v.dataset.origStyle !== undefined) {
-                        v.setAttribute('style', v.dataset.origStyle);
-                    }
-                })();
-                """.trimIndent(), null
+                "var s = document.getElementById('ultra-pip-css'); if (s) s.remove();",
+                null
             )
         }
     }
@@ -223,6 +245,8 @@ fun MainAppContainer(
     onHideFullscreen: () -> Unit
 ) {
     var isMusicFullPlayerOpen by remember { mutableStateOf(false) }
+    var currentMusicSong by remember { mutableStateOf<MediaFile?>(null) }
+    var lastBackPressTime by remember { mutableLongStateOf(0L) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -261,22 +285,36 @@ fun MainAppContainer(
         return
     }
 
-    BackHandler(enabled = selectedTab == 0) {
-        val wv = activity.activeWebView
-        if (wv != null && wv.canGoBack()) {
-            wv.goBack()
-        } else {
+    // সব ট্যাবের জন্য ডাবল-ব্যাক এক্সিট হ্যান্ডলার
+    BackHandler(enabled = !isMusicFullPlayerOpen) {
+        if (selectedTab == 0) {
+            val wv = activity.activeWebView
+            if (wv != null && wv.canGoBack()) {
+                wv.goBack()
+                return@BackHandler
+            }
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastBackPressTime < 2000L) {
             activity.moveTaskToBack(true)
+        } else {
+            lastBackPressTime = now
+            Toast.makeText(activity, "বের হতে আবার ব্যাক চাপুন", Toast.LENGTH_SHORT).show()
         }
     }
+
+    val musicTopBg = if (isDarkTheme) Color(0xFF2B1212) else MaterialTheme.colorScheme.background
 
     Scaffold(
         topBar = {
             if (!isPipMode && selectedTab != 0 && !isMusicFullPlayerOpen) {
                 TopAppBar(
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = if (selectedTab == 2) musicTopBg else MaterialTheme.colorScheme.background
+                    ),
                     title = {
                         Text(
-                            if (selectedTab == 1) "Videos" else "Muzio Player",
+                            text = if (selectedTab == 1) "Videos" else "Music",
                             fontWeight = FontWeight.Bold,
                             fontSize = 18.sp
                         )
@@ -293,9 +331,10 @@ fun MainAppContainer(
             }
         },
         bottomBar = {
+            // আল্ট্রা-স্লিম 40dp বটম বার
             if (!isPipMode && !isMusicFullPlayerOpen) {
                 Surface(
-                    tonalElevation = 3.dp,
+                    tonalElevation = 2.dp,
                     shadowElevation = 6.dp,
                     color = MaterialTheme.colorScheme.surface
                 ) {
@@ -303,7 +342,7 @@ fun MainAppContainer(
                         modifier = Modifier
                             .fillMaxWidth()
                             .navigationBarsPadding()
-                            .height(46.dp),
+                            .height(40.dp),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -327,21 +366,39 @@ fun MainAppContainer(
             }
         }
     ) { padding ->
-        Box(modifier = Modifier.padding(padding).fillMaxSize()) {
-            Box(modifier = if (selectedTab == 0) Modifier.fillMaxSize() else Modifier.size(0.dp)) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            // YouTube ট্যাবে স্ট্যাটাস বার কালো ব্যাকগ্রাউন্ডে পরিষ্কার দেখাবে
+            Box(
+                modifier = if (selectedTab == 0) {
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black)
+                        .then(if (!isPipMode) Modifier.statusBarsPadding().padding(bottom = padding.calculateBottomPadding()) else Modifier)
+                } else {
+                    Modifier.size(0.dp)
+                }
+            ) {
                 YouTubeTabScreen(
                     activity = activity,
+                    isVisible = selectedTab == 0,
                     onShowFullscreen = onShowFullscreen,
                     onHideFullscreen = onHideFullscreen
                 )
             }
 
             if (selectedTab == 1) {
-                VideoListTabScreen()
+                Box(modifier = Modifier.padding(padding).fillMaxSize()) {
+                    VideoListTabScreen()
+                }
             } else if (selectedTab == 2) {
-                MuzioMusicTabScreen(
-                    onFullPlayerChanged = { isMusicFullPlayerOpen = it }
-                )
+                Box(modifier = Modifier.padding(padding).fillMaxSize()) {
+                    MuzioMusicTabScreen(
+                        isDarkTheme = isDarkTheme,
+                        currentSong = currentMusicSong,
+                        onSongChanged = { currentMusicSong = it },
+                        onFullPlayerChanged = { isMusicFullPlayerOpen = it }
+                    )
+                }
             }
         }
     }
@@ -351,17 +408,17 @@ fun MainAppContainer(
 fun CompactTabIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, selected: Boolean, onClick: () -> Unit) {
     Box(
         modifier = Modifier
-            .clip(RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(14.dp))
             .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else Color.Transparent)
             .clickable { onClick() }
-            .padding(horizontal = 24.dp, vertical = 6.dp),
+            .padding(horizontal = 24.dp, vertical = 4.dp),
         contentAlignment = Alignment.Center
     ) {
         Icon(
             imageVector = icon,
             contentDescription = null,
             tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-            modifier = Modifier.size(24.dp)
+            modifier = Modifier.size(22.dp)
         )
     }
 }
@@ -376,6 +433,7 @@ class BackgroundWebView(context: Context) : WebView(context) {
 @Composable
 fun YouTubeTabScreen(
     activity: MainActivity,
+    isVisible: Boolean,
     onShowFullscreen: (View, WebChromeClient.CustomViewCallback) -> Unit,
     onHideFullscreen: () -> Unit
 ) {
@@ -388,22 +446,41 @@ fun YouTubeTabScreen(
                 window.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
                 document.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
                 window.addEventListener('webkitvisibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
-                var style = document.getElementById('ultra-hide-css');
-                if (!style) {
-                    style = document.createElement('style');
-                    style.id = 'ultra-hide-css';
-                    style.innerHTML = 'ytm-promoted-sparkles-web-renderer, .open-app-button, ytm-pivot-bar-item-renderer[aria-label="Open App"], button[aria-label="Open App"] { display: none !important; }';
-                    document.head.appendChild(style);
+
+                function cleanUiAndTrack() {
+                    document.querySelectorAll('a, button, ytm-button-renderer').forEach(function(el) {
+                        var txt = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                        if (txt === 'open app') {
+                            el.style.display = 'none';
+                        }
+                    });
+                    var v = document.querySelector('video');
+                    if (window.UltraBridge) {
+                        var playing = !!(v && !v.paused && !v.ended && v.readyState > 1);
+                        window.UltraBridge.reportPlaying(playing);
+                    }
                 }
+                if (!window.__ultraTrackerInstalled) {
+                    window.__ultraTrackerInstalled = true;
+                    setInterval(cleanUiAndTrack, 500);
+                }
+                cleanUiAndTrack();
             } catch(e) {}
         })();
     """.trimIndent()
 
     AndroidView(
         modifier = Modifier.fillMaxSize(),
+        update = { webView ->
+            webView.visibility = if (isVisible) View.VISIBLE else View.GONE
+        },
         factory = { ctx ->
             val webView = BackgroundWebView(ctx)
             activity.activeWebView = webView
+            webView.addJavascriptInterface(
+                YouTubeJsBridge { playing -> activity.isYouTubePlaying = playing },
+                "UltraBridge"
+            )
 
             val cookieManager = CookieManager.getInstance()
             cookieManager.setAcceptCookie(true)
@@ -421,9 +498,7 @@ fun YouTubeTabScreen(
             webView.webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                     val url = request?.url?.toString() ?: return false
-                    if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                        return true
-                    }
+                    if (!url.startsWith("http://") && !url.startsWith("https://")) return true
                     return false
                 }
 
@@ -440,9 +515,7 @@ fun YouTubeTabScreen(
 
             webView.webChromeClient = object : WebChromeClient() {
                 override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
-                    if (view != null && callback != null) {
-                        onShowFullscreen(view, callback)
-                    }
+                    if (view != null && callback != null) onShowFullscreen(view, callback)
                 }
 
                 override fun onHideCustomView() {
@@ -553,9 +626,7 @@ fun VideoListTabScreen() {
                     MediaScanner.deleteFile(activity, target.uri, deleteLauncher) { refreshKey++ }
                 }) { Text("Delete", color = Color.Red) }
             },
-            dismissButton = {
-                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
-            }
+            dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } }
         )
     }
 
@@ -584,15 +655,18 @@ fun VideoListTabScreen() {
                     }
                 }) { Text("Save") }
             },
-            dismissButton = {
-                TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
-            }
+            dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
         )
     }
 }
 
 @Composable
-fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
+fun MuzioMusicTabScreen(
+    isDarkTheme: Boolean,
+    currentSong: MediaFile?,
+    onSongChanged: (MediaFile?) -> Unit,
+    onFullPlayerChanged: (Boolean) -> Unit
+) {
     val context = LocalContext.current
     val activity = context as Activity
     val prefs = remember { context.getSharedPreferences("muzio_favs", Context.MODE_PRIVATE) }
@@ -606,7 +680,6 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
     }
 
     var mediaController by remember { mutableStateOf<MediaController?>(null) }
-    var currentSong by remember { mutableStateOf<MediaFile?>(null) }
     var isPlaying by remember { mutableStateOf(false) }
     var currentPos by remember { mutableLongStateOf(0L) }
     var totalDur by remember { mutableLongStateOf(1L) }
@@ -671,7 +744,7 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
     }
 
     fun playSong(song: MediaFile) {
-        currentSong = song
+        onSongChanged(song)
         mediaController?.apply {
             setMediaItem(MediaItem.fromUri(song.uri))
             prepare()
@@ -700,17 +773,24 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
         }
     }
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Brush.verticalGradient(listOf(Color(0xFF2B1212), Color(0xFF120B0B))))
-    ) {
+    val bgBrush = if (isDarkTheme) {
+        Brush.verticalGradient(listOf(Color(0xFF2B1212), Color(0xFF120B0B)))
+    } else {
+        Brush.verticalGradient(listOf(Color(0xFFFAFAFA), Color(0xFFF0ECEC)))
+    }
+    val titleColor = if (isDarkTheme) Color.White else Color(0xFF1A1A1A)
+    val subColor = if (isDarkTheme) Color.LightGray else Color(0xFF666666)
+    val accentColor = if (isDarkTheme) Color(0xFFFFC107) else Color(0xFFD32F2F)
+    val iconBoxColor = if (isDarkTheme) Color(0xFF3A2424) else Color(0xFFEDE2E2)
+    val miniPlayerBg = if (isDarkTheme) Color(0xFF261717) else Color(0xFFEAE3E3)
+
+    Box(modifier = Modifier.fillMaxSize().background(bgBrush)) {
         Column(modifier = Modifier.fillMaxSize()) {
             val tabs = listOf("Songs", "Favorites", "Artists", "Albums")
             TabRow(
                 selectedTabIndex = selectedCategory,
                 containerColor = Color.Transparent,
-                contentColor = Color(0xFFFFC107)
+                contentColor = accentColor
             ) {
                 tabs.forEachIndexed { idx, title ->
                     Tab(
@@ -720,7 +800,7 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
                             Text(
                                 title,
                                 fontSize = 13.sp,
-                                color = if (selectedCategory == idx) Color(0xFFFFC107) else Color.LightGray
+                                color = if (selectedCategory == idx) accentColor else subColor
                             )
                         }
                     )
@@ -730,13 +810,13 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
-                placeholder = { Text("Search ${displayedSongs.size} songs...", color = Color.LightGray) },
-                leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, tint = Color(0xFFFFC107)) },
+                placeholder = { Text("Search ${displayedSongs.size} songs...", color = subColor) },
+                leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, tint = accentColor) },
                 colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White,
-                    focusedBorderColor = Color(0xFFFFC107),
-                    unfocusedBorderColor = Color.Gray
+                    focusedTextColor = titleColor,
+                    unfocusedTextColor = titleColor,
+                    focusedBorderColor = accentColor,
+                    unfocusedBorderColor = subColor.copy(alpha = 0.5f)
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -748,8 +828,8 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
             if (displayedSongs.isEmpty()) {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Text(
-                        if (selectedCategory == 1) "কোনো Favorite গান নেই (হৃদয় আইকনে ট্যাপ করে যোগ করুন)" else "কোনো অডিও পাওয়া যায়নি",
-                        color = Color.LightGray,
+                        if (selectedCategory == 1) "কোনো Favorite গান নেই" else "কোনো অডিও পাওয়া যায়নি",
+                        color = subColor,
                         fontSize = 14.sp
                     )
                 }
@@ -768,26 +848,24 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
                                     modifier = Modifier
                                         .size(44.dp)
                                         .clip(RoundedCornerShape(8.dp))
-                                        .background(Color(0xFF3A2424)),
+                                        .background(iconBoxColor),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = Color(0xFFFFC107))
+                                    Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = accentColor)
                                 }
                             },
                             headlineContent = {
-                                Text(song.title, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(song.title, color = titleColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             },
                             supportingContent = {
-                                val sub = when (selectedCategory) {
-                                    3 -> "${song.album} • ${formatMillis(song.duration)}"
-                                    else -> "${song.artist} • ${formatMillis(song.duration)}"
-                                }
-                                Text(sub, color = Color.Gray, fontSize = 12.sp, maxLines = 1)
+                                val sub = if (selectedCategory == 3) "${song.album} • ${formatMillis(song.duration)}"
+                                else "${song.artist} • ${formatMillis(song.duration)}"
+                                Text(sub, color = subColor, fontSize = 12.sp, maxLines = 1)
                             },
                             trailingContent = {
                                 Box {
                                     IconButton(onClick = { menuExpanded = true }) {
-                                        Icon(Icons.Rounded.MoreVert, contentDescription = "Options", tint = Color.LightGray)
+                                        Icon(Icons.Rounded.MoreVert, contentDescription = "Options", tint = subColor)
                                     }
                                     DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
                                         DropdownMenuItem(
@@ -821,10 +899,18 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
             }
         }
 
+        // ভাসমান শাফেল বাটন
         FloatingActionButton(
-            onClick = { if (displayedSongs.isNotEmpty()) playSong(displayedSongs.random()) },
-            containerColor = Color(0xFFFFC107),
-            contentColor = Color.Black,
+            onClick = {
+                if (displayedSongs.isNotEmpty()) {
+                    val pool = if (displayedSongs.size > 1 && currentSong != null) {
+                        displayedSongs.filter { it.id != currentSong.id }
+                    } else displayedSongs
+                    playSong(pool.random())
+                }
+            },
+            containerColor = accentColor,
+            contentColor = if (isDarkTheme) Color.Black else Color.White,
             shape = CircleShape,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
@@ -833,42 +919,41 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
             Icon(Icons.Rounded.Shuffle, contentDescription = "Shuffle")
         }
 
+        // মিনি-প্লেয়ার বার
         currentSong?.let { song ->
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .background(Color(0xFF261717))
+                    .background(miniPlayerBg)
                     .clickable { showFullPlayer = true }
                     .padding(horizontal = 14.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Rounded.Album, contentDescription = null, tint = Color(0xFFFFC107), modifier = Modifier.size(34.dp))
+                Icon(Icons.Rounded.Album, contentDescription = null, tint = accentColor, modifier = Modifier.size(34.dp))
                 Spacer(modifier = Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(song.title, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                    Text(song.artist, color = Color.LightGray, fontSize = 11.sp, maxLines = 1)
+                    Text(song.title, color = titleColor, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(song.artist, color = subColor, fontSize = 11.sp, maxLines = 1)
                 }
                 IconButton(onClick = {
                     if (isPlaying) mediaController?.pause() else mediaController?.play()
                 }) {
-                    Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, contentDescription = "Play", tint = Color.White)
+                    Icon(if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, contentDescription = "Play", tint = titleColor)
                 }
                 IconButton(onClick = { showEqualizer = true }) {
-                    Icon(Icons.Rounded.Equalizer, contentDescription = "EQ", tint = Color(0xFFFFC107))
+                    Icon(Icons.Rounded.Equalizer, contentDescription = "EQ", tint = accentColor)
                 }
             }
         }
 
+        // ফুলস্ক্রিন মিউজিক প্লেয়ার
         if (showFullPlayer && currentSong != null) {
             BackHandler { showFullPlayer = false }
-            val song = currentSong!!
+            val song = currentSong
             val isFav = favoriteIds.contains(song.id.toString())
 
-            Surface(
-                modifier = Modifier.fillMaxSize(),
-                color = Color(0xFF7A6348)
-            ) {
+            Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF7A6348)) {
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -1013,7 +1098,7 @@ fun MuzioMusicTabScreen(onFullPlayerChanged: (Boolean) -> Unit) {
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 fontWeight = if (s.id == currentSong?.id) FontWeight.Bold else FontWeight.Normal,
-                                color = if (s.id == currentSong?.id) Color(0xFFFFC107) else MaterialTheme.colorScheme.onSurface,
+                                color = if (s.id == currentSong?.id) accentColor else MaterialTheme.colorScheme.onSurface,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
