@@ -3,6 +3,7 @@ package com.example.ultramediapro
 import android.app.AlertDialog
 import android.app.PictureInPictureParams
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -59,11 +60,13 @@ class VideoPlayerActivity : ComponentActivity() {
     private var currentPfd: ParcelFileDescriptor? = null
     private var sleepTimer: CountDownTimer? = null
     private var isBackgroundAudioMode = false
+    private var isPipMode by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        // উল্টে যাওয়া বা অতিরিক্ত ঘোরা বন্ধ করতে স্বাভাবিক SENSOR মোড
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
         hideSystemBars()
 
         val videoUriString = intent.getStringExtra("VIDEO_URI") ?: return finish()
@@ -77,15 +80,10 @@ class VideoPlayerActivity : ComponentActivity() {
         libVLC = LibVLC(this, options)
         mediaPlayer = MediaPlayer(libVLC)
 
-        // Android 11+ Scoped Storage-এ ভিডিও চালানোর জন্য ParcelFileDescriptor ব্যবহার
         val uri = Uri.parse(videoUriString)
         val media = try {
             currentPfd = contentResolver.openFileDescriptor(uri, "r")
-            if (currentPfd != null) {
-                Media(libVLC, currentPfd!!.fileDescriptor)
-            } else {
-                Media(libVLC, uri)
-            }
+            if (currentPfd != null) Media(libVLC, currentPfd!!.fileDescriptor) else Media(libVLC, uri)
         } catch (_: Exception) {
             Media(libVLC, uri)
         }
@@ -99,12 +97,20 @@ class VideoPlayerActivity : ComponentActivity() {
                 VlcStylePlayerScreen(
                     mediaPlayer = mediaPlayer,
                     videoTitle = videoTitle,
+                    isPipMode = isPipMode,
                     onBack = { finish() },
                     onEnterPip = {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            enterPictureInPictureMode(
-                                PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()
-                            )
+                            try {
+                                val entered = enterPictureInPictureMode(
+                                    PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()
+                                )
+                                if (!entered) {
+                                    Toast.makeText(this, "App Info থেকে PiP পারমিশন চালু করুন", Toast.LENGTH_SHORT).show()
+                                }
+                            } catch (_: Exception) {
+                                Toast.makeText(this, "App Info থেকে PiP পারমিশন চালু করুন", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     },
                     onPlayAsAudio = {
@@ -133,6 +139,14 @@ class VideoPlayerActivity : ComponentActivity() {
         }
     }
 
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        isPipMode = isInPictureInPictureMode
+    }
+
     private fun hideSystemBars() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val controller = WindowInsetsControllerCompat(window, window.decorView)
@@ -142,7 +156,7 @@ class VideoPlayerActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (hasFocus && !isPipMode) hideSystemBars()
     }
 
     private fun showTrackSelectionDialog() {
@@ -195,6 +209,7 @@ class VideoPlayerActivity : ComponentActivity() {
 fun VlcStylePlayerScreen(
     mediaPlayer: MediaPlayer,
     videoTitle: String,
+    isPipMode: Boolean,
     onBack: () -> Unit,
     onEnterPip: () -> Unit,
     onPlayAsAudio: () -> Unit,
@@ -214,10 +229,25 @@ fun VlcStylePlayerScreen(
     var overlayText by remember { mutableStateOf("") }
     var zoomMode by remember { mutableIntStateOf(0) }
     var currentVolume by remember { mutableIntStateOf(100) }
-    var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
+
+    val speedSteps = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+    var speedIdx by remember { mutableIntStateOf(2) } // 1.0x Normal
+    val currentSpeed = speedSteps[speedIdx]
+    val speedLabel = when {
+        currentSpeed == 1.0f -> "1.0x"
+        currentSpeed > 1.0f -> "+${currentSpeed}x"
+        else -> "-${currentSpeed}x"
+    }
 
     val vlcEq = remember { MediaPlayer.Equalizer.create() }
     var eqEnabled by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isPipMode) {
+        if (isPipMode) {
+            showControls = false
+            showSideMenu = false
+        }
+    }
 
     LaunchedEffect(showControls, showSideMenu) {
         if (showControls && !showSideMenu) {
@@ -228,8 +258,7 @@ fun VlcStylePlayerScreen(
 
     LaunchedEffect(Unit) {
         while (true) {
-            val playing = mediaPlayer.isPlaying
-            isPlaying = playing
+            isPlaying = mediaPlayer.isPlaying
             val t = mediaPlayer.time
             val len = mediaPlayer.length
             if (t >= 0) currentTime = t
@@ -242,19 +271,15 @@ fun VlcStylePlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .pointerInput(isLocked) {
+            .pointerInput(isLocked, isPipMode) {
                 detectTapGestures(
                     onTap = {
-                        if (!isLocked) {
-                            if (showSideMenu) {
-                                showSideMenu = false
-                            } else {
-                                showControls = !showControls
-                            }
+                        if (!isLocked && !isPipMode) {
+                            if (showSideMenu) showSideMenu = false else showControls = !showControls
                         }
                     },
                     onDoubleTap = { offset ->
-                        if (!isLocked) {
+                        if (!isLocked && !isPipMode) {
                             if (offset.x < size.width / 2) {
                                 mediaPlayer.setTime((mediaPlayer.time - 10000).coerceAtLeast(0))
                                 overlayText = "-10s"
@@ -266,9 +291,9 @@ fun VlcStylePlayerScreen(
                     }
                 )
             }
-            .pointerInput(isLocked) {
+            .pointerInput(isLocked, isPipMode) {
                 detectDragGestures { change, dragAmount ->
-                    if (isLocked) return@detectDragGestures
+                    if (isLocked || isPipMode) return@detectDragGestures
                     change.consume()
                     if (abs(dragAmount.y) > abs(dragAmount.x)) {
                         val delta = (-dragAmount.y / size.height) * 100
@@ -299,7 +324,7 @@ fun VlcStylePlayerScreen(
             }
         )
 
-        if (overlayText.isNotEmpty()) {
+        if (overlayText.isNotEmpty() && !isPipMode) {
             LaunchedEffect(overlayText) {
                 delay(1200)
                 overlayText = ""
@@ -314,7 +339,7 @@ fun VlcStylePlayerScreen(
             }
         }
 
-        if (isLocked) {
+        if (isLocked && !isPipMode) {
             IconButton(
                 onClick = { isLocked = false; showControls = true },
                 modifier = Modifier
@@ -327,13 +352,8 @@ fun VlcStylePlayerScreen(
             }
         }
 
-        // সেফ প্যাডিংসহ কন্ট্রোল (ফোনের ন্যাভিগেশন বাটনের সাথে কখনো মিশবে না)
-        AnimatedVisibility(visible = showControls && !isLocked, enter = fadeIn(), exit = fadeOut()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .safeDrawingPadding()
-            ) {
+        AnimatedVisibility(visible = showControls && !isLocked && !isPipMode, enter = fadeIn(), exit = fadeOut()) {
+            Box(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -424,12 +444,17 @@ fun VlcStylePlayerScreen(
                         }
 
                         Row {
+                            // ম্যানুয়াল রোটেশন বাটন (চাপলে Landscape/Portrait স্থির লক থাকবে, নিজে থেকে ঘুরবে না)
                             IconButton(onClick = {
                                 val act = context as ComponentActivity
-                                act.requestedOrientation =
-                                    if (act.requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
-                                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-                                    else ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                                val isNowLandscape = act.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                                if (isNowLandscape) {
+                                    act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                    overlayText = "Portrait"
+                                } else {
+                                    act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                                    overlayText = "Landscape"
+                                }
                             }) {
                                 Icon(Icons.Rounded.ScreenRotation, contentDescription = "Rotate", tint = Color.White)
                             }
@@ -442,9 +467,9 @@ fun VlcStylePlayerScreen(
             }
         }
 
-        // VLC সাইড মেনু (সেফ প্যাডিংসহ)
+        // VLC সাইড মেনু (স্পিড কন্ট্রোলের জন্য সরাসরি - এবং + বাটনসহ)
         AnimatedVisibility(
-            visible = showSideMenu && !isLocked,
+            visible = showSideMenu && !isLocked && !isPipMode,
             enter = slideInHorizontally(initialOffsetX = { it }),
             exit = slideOutHorizontally(targetOffsetX = { it }),
             modifier = Modifier
@@ -453,28 +478,70 @@ fun VlcStylePlayerScreen(
         ) {
             Column(
                 modifier = Modifier
-                    .width(230.dp)
+                    .width(250.dp)
                     .fillMaxHeight()
                     .background(Color(0xEE1E1A17))
                     .verticalScroll(rememberScrollState())
                     .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 SideMenuItem(Icons.Rounded.LockOpen, "Lock") { isLocked = true; showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Bedtime, "Sleep timer") { showSleepDialog = true; showSideMenu = false }
-                SideMenuItem(Icons.Rounded.Speed, "Playback speed (${playbackSpeed}x)") {
-                    playbackSpeed = if (playbackSpeed >= 2.0f) 0.5f else playbackSpeed + 0.25f
-                    mediaPlayer.setRate(playbackSpeed)
+
+                // Playback Speed Row: [-] 1.0x [+]
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.Speed, contentDescription = null, tint = Color.White, modifier = Modifier.size(22.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = speedLabel,
+                            color = if (currentSpeed == 1.0f) Color.White else Color(0xFFFF8800),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clickable {
+                                speedIdx = 2
+                                mediaPlayer.setRate(1.0f)
+                            }
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = {
+                                if (speedIdx > 0) {
+                                    speedIdx--
+                                    mediaPlayer.setRate(speedSteps[speedIdx])
+                                }
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Rounded.Remove, contentDescription = "Slower", tint = Color.White)
+                        }
+                        IconButton(
+                            onClick = {
+                                if (speedIdx < speedSteps.lastIndex) {
+                                    speedIdx++
+                                    mediaPlayer.setRate(speedSteps[speedIdx])
+                                }
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Rounded.Add, contentDescription = "Faster", tint = Color.White)
+                        }
+                    }
                 }
+
                 SideMenuItem(Icons.Rounded.HistoryToggleOff, "Jump to Time") { showJumpDialog = true; showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Tune, "Equalizer") { showEqDialog = true; showSideMenu = false }
                 SideMenuItem(Icons.Rounded.Headphones, "Play as audio") { onPlayAsAudio(); showSideMenu = false }
-                SideMenuItem(Icons.Rounded.PictureInPictureAlt, "Pop-Up player") { onEnterPip(); showSideMenu = false }
+                SideMenuItem(Icons.Rounded.PictureInPictureAlt, "Pop-Up player") { showSideMenu = false; onEnterPip() }
             }
         }
 
-        // ১০-ব্যান্ড VLC ইকুলাইজার ডায়ালগ
-        if (showEqDialog) {
+        if (showEqDialog && !isPipMode) {
             AlertDialog(
                 onDismissRequest = { showEqDialog = false },
                 title = {
@@ -510,14 +577,11 @@ fun VlcStylePlayerScreen(
                         }
                     }
                 },
-                confirmButton = {
-                    TextButton(onClick = { showEqDialog = false }) { Text("Done") }
-                }
+                confirmButton = { TextButton(onClick = { showEqDialog = false }) { Text("Done") } }
             )
         }
 
-        // Sleep Timer ডায়ালগ
-        if (showSleepDialog) {
+        if (showSleepDialog && !isPipMode) {
             AlertDialog(
                 onDismissRequest = { showSleepDialog = false },
                 title = { Text("Sleep Timer") },
@@ -535,8 +599,7 @@ fun VlcStylePlayerScreen(
             )
         }
 
-        // Jump to Time ডায়ালগ
-        if (showJumpDialog) {
+        if (showJumpDialog && !isPipMode) {
             AlertDialog(
                 onDismissRequest = { showJumpDialog = false },
                 title = { Text("Jump to Time") },
