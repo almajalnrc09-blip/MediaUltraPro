@@ -4,8 +4,6 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.PictureInPictureParams
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
@@ -14,7 +12,6 @@ import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -44,6 +41,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -81,7 +80,6 @@ import androidx.media3.session.SessionToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import kotlin.math.abs
 
 class YouTubeJsBridge(private val onPlayingChanged: (Boolean) -> Unit) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -107,17 +105,17 @@ class MainActivity : ComponentActivity() {
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        val prefs = getSharedPreferences("ultra_prefs", MODE_PRIVATE)
 
         setContent {
-            var isDarkTheme by remember { mutableStateOf(prefs.getBoolean("dark_mode", true)) }
+            // ফোনের সিস্টেম থিম (Dark / Light / Power Saving) অনুযায়ী স্বয়ংক্রিয় অ্যাডাপ্টিভ থিম
+            val isDarkTheme = isSystemInDarkTheme()
             val view = LocalView.current
 
             SideEffect {
                 val controller = WindowInsetsControllerCompat(window, view)
                 val useDarkStatusIcons = when {
                     customFullscreenView != null -> false
-                    selectedTab == 0 -> false
+                    selectedTab == 0 -> false // YouTube-এর কালো স্ট্যাটাস বারে সাদা আইকন
                     else -> !isDarkTheme
                 }
                 controller.isAppearanceLightStatusBars = useDarkStatusIcons
@@ -127,7 +125,7 @@ class MainActivity : ComponentActivity() {
             val colorScheme = if (isDarkTheme) {
                 darkColorScheme(
                     background = Color(0xFF140C0C),
-                    surface = Color(0xFF1C1111),
+                    surface = Color(0xFF1F1414),
                     primary = Color(0xFFFFC107)
                 )
             } else {
@@ -144,10 +142,6 @@ class MainActivity : ComponentActivity() {
                     selectedTab = selectedTab,
                     onTabSelected = { selectedTab = it },
                     isDarkTheme = isDarkTheme,
-                    onToggleTheme = {
-                        isDarkTheme = !isDarkTheme
-                        prefs.edit().putBoolean("dark_mode", isDarkTheme).apply()
-                    },
                     isPipMode = isPipMode,
                     fullscreenView = customFullscreenView,
                     onShowFullscreen = { fsView, callback ->
@@ -163,9 +157,10 @@ class MainActivity : ComponentActivity() {
     }
 
     fun exitYouTubeFullscreen() {
-        customViewCallback?.onCustomViewHidden()
+        val cb = customViewCallback
         customViewCallback = null
         customFullscreenView = null
+        cb?.onCustomViewHidden()
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         setImmersiveMode(false)
     }
@@ -189,7 +184,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        if (selectedTab == 0 && isYouTubePlaying) {
+        if (selectedTab == 0 && (isYouTubePlaying || customFullscreenView != null)) {
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
             try {
@@ -205,12 +200,25 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (selectedTab == 0 && isYouTubePlaying && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (selectedTab == 0 && (isYouTubePlaying || customFullscreenView != null) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
+            // PiP-এ যাওয়ার আগে অপ্রয়োজনীয় হেডার/কমেন্ট লুকিয়ে ভিডিও ফ্রেম ওপরে আনা
             activeWebView?.evaluateJavascript(
-                "var v = document.querySelector('video'); if (v && v.paused) { v.play().catch(function(){}); }",
-                null
+                """
+                (function() {
+                    var s = document.getElementById('ultra-pip-css');
+                    if (!s) {
+                        s = document.createElement('style');
+                        s.id = 'ultra-pip-css';
+                        s.innerHTML = 'ytm-mobile-topbar-renderer, .watch-below-the-player, ytm-pivot-bar-renderer, .related-items-container { display: none !important; } body { background: #000 !important; }';
+                        document.head.appendChild(s);
+                    }
+                    window.scrollTo(0, 0);
+                    var v = document.querySelector('video');
+                    if (v && v.paused) { v.play().catch(function(){}); }
+                })();
+                """.trimIndent(), null
             )
             try {
                 enterPictureInPictureMode(
@@ -228,22 +236,14 @@ class MainActivity : ComponentActivity() {
         isPipMode = isInPictureInPictureMode
         activeWebView?.onResume()
         activeWebView?.resumeTimers()
-        if (isInPictureInPictureMode) {
+        if (!isInPictureInPictureMode) {
             activeWebView?.evaluateJavascript(
-                """
-                (function() {
-                    var v = document.querySelector('video');
-                    if (v) {
-                        v.muted = false;
-                        if (v.paused) v.play().catch(function(){});
-                    }
-                    var fsBtn = document.querySelector('button.fullscreen-icon, [aria-label*="Full screen"], [aria-label*="full screen"]');
-                    if (fsBtn && !document.fullscreenElement) { fsBtn.click(); }
-                })();
-                """.trimIndent(), null
+                "var s = document.getElementById('ultra-pip-css'); if (s) s.remove();",
+                null
             )
-        } else {
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            if (customFullscreenView == null) {
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
         }
     }
 
@@ -260,7 +260,6 @@ fun MainAppContainer(
     selectedTab: Int,
     onTabSelected: (Int) -> Unit,
     isDarkTheme: Boolean,
-    onToggleTheme: () -> Unit,
     isPipMode: Boolean,
     fullscreenView: View?,
     onShowFullscreen: (View, WebChromeClient.CustomViewCallback) -> Unit,
@@ -287,142 +286,7 @@ fun MainAppContainer(
         permissionLauncher.launch(perms.toTypedArray())
     }
 
-    if (fullscreenView != null) {
-        var ytLocked by remember { mutableStateOf(false) }
-        var gestureHud by remember { mutableStateOf("") }
-        var showFsBar by remember { mutableStateOf(true) }
-        val audioManager = remember { activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
-
-        LaunchedEffect(showFsBar) {
-            if (showFsBar) {
-                delay(3500)
-                showFsBar = false
-            }
-        }
-
-        BackHandler {
-            if (!ytLocked) onHideFullscreen()
-            else Toast.makeText(activity, "স্ক্রিন আনলক করুন", Toast.LENGTH_SHORT).show()
-        }
-
-        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    FrameLayout(ctx).apply {
-                        (fullscreenView.parent as? ViewGroup)?.removeView(fullscreenView)
-                        addView(
-                            fullscreenView,
-                            FrameLayout.LayoutParams(
-                                FrameLayout.LayoutParams.MATCH_PARENT,
-                                FrameLayout.LayoutParams.MATCH_PARENT
-                            )
-                        )
-                    }
-                }
-            )
-
-            if (ytLocked) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(Unit) {
-                            detectDragGestures { _, _ -> }
-                        }
-                ) {
-                    IconButton(
-                        onClick = { ytLocked = false; showFsBar = true },
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .safeDrawingPadding()
-                            .padding(14.dp)
-                            .background(Color(0x99000000), CircleShape)
-                    ) {
-                        Icon(Icons.Rounded.Lock, contentDescription = "Unlock", tint = Color(0xFFFFC107))
-                    }
-                }
-            } else {
-                Row(modifier = Modifier.fillMaxSize()) {
-                    Box(
-                        modifier = Modifier
-                            .weight(0.22f)
-                            .fillMaxHeight()
-                            .pointerInput(Unit) {
-                                detectDragGestures { change, dragAmount ->
-                                    if (abs(dragAmount.y) > abs(dragAmount.x)) {
-                                        change.consume()
-                                        val lp = activity.window.attributes
-                                        val cur = if (lp.screenBrightness < 0) 0.5f else lp.screenBrightness
-                                        val next = (cur + (-dragAmount.y / size.height)).coerceIn(0.05f, 1.0f)
-                                        lp.screenBrightness = next
-                                        activity.window.attributes = lp
-                                        gestureHud = "Brightness: ${(next * 100).toInt()}%"
-                                    }
-                                }
-                            }
-                    )
-                    Spacer(modifier = Modifier.weight(0.56f))
-                    Box(
-                        modifier = Modifier
-                            .weight(0.22f)
-                            .fillMaxHeight()
-                            .pointerInput(Unit) {
-                                detectDragGestures { change, dragAmount ->
-                                    if (abs(dragAmount.y) > abs(dragAmount.x)) {
-                                        change.consume()
-                                        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                                        val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                                        val step = if (dragAmount.y < 0) 1 else -1
-                                        val nextVol = (curVol + step).coerceIn(0, maxVol)
-                                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, nextVol, 0)
-                                        gestureHud = "Volume: ${(nextVol * 100) / maxVol}%"
-                                    }
-                                }
-                            }
-                    )
-                }
-
-                Row(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .safeDrawingPadding()
-                        .padding(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    IconButton(
-                        onClick = { ytLocked = true },
-                        modifier = Modifier.size(38.dp).background(Color(0x88000000), CircleShape)
-                    ) {
-                        Icon(Icons.Rounded.LockOpen, contentDescription = "Lock Screen", tint = Color.White, modifier = Modifier.size(20.dp))
-                    }
-                    IconButton(
-                        onClick = { onHideFullscreen() },
-                        modifier = Modifier.size(38.dp).background(Color(0x88000000), CircleShape)
-                    ) {
-                        Icon(Icons.Rounded.FullscreenExit, contentDescription = "Exit Fullscreen", tint = Color.White, modifier = Modifier.size(22.dp))
-                    }
-                }
-            }
-
-            if (gestureHud.isNotEmpty()) {
-                LaunchedEffect(gestureHud) {
-                    delay(1000)
-                    gestureHud = ""
-                }
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .background(Color(0xAA000000), RoundedCornerShape(10.dp))
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                ) {
-                    Text(gestureHud, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                }
-            }
-        }
-        return
-    }
-
-    BackHandler(enabled = !isMusicFullPlayerOpen) {
+    BackHandler(enabled = !isMusicFullPlayerOpen && fullscreenView == null) {
         if (selectedTab == 0) {
             val wv = activity.activeWebView
             if (wv != null && wv.canGoBack()) {
@@ -441,97 +305,160 @@ fun MainAppContainer(
 
     val musicTopBg = if (isDarkTheme) Color(0xFF2B1212) else MaterialTheme.colorScheme.background
 
-    Scaffold(
-        topBar = {
-            if (!isPipMode && selectedTab != 0 && !isMusicFullPlayerOpen) {
-                TopAppBar(
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = if (selectedTab == 2) musicTopBg else MaterialTheme.colorScheme.background
-                    ),
-                    title = {
-                        Text(
-                            text = if (selectedTab == 1) "Videos" else "Music",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 18.sp
-                        )
-                    },
-                    actions = {
-                        IconButton(onClick = onToggleTheme) {
-                            Icon(
-                                if (isDarkTheme) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
-                                contentDescription = "Theme"
+    // মূল রুট Box — WebView কখনোই আনমাউন্ট হবে না, তাই ফুলস্ক্রিন থেকে বের হলে আর রিফ্রেশ হবে না
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            topBar = {
+                if (!isPipMode && selectedTab != 0 && !isMusicFullPlayerOpen && fullscreenView == null) {
+                    TopAppBar(
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = if (selectedTab == 2) musicTopBg else MaterialTheme.colorScheme.background
+                        ),
+                        title = {
+                            Text(
+                                text = if (selectedTab == 1) "Videos" else "Music",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 18.sp
                             )
                         }
-                    }
-                )
+                    )
+                }
             }
-        },
-        bottomBar = {
-            if (!isPipMode && !isMusicFullPlayerOpen) {
-                Surface(
-                    tonalElevation = 2.dp,
-                    shadowElevation = 6.dp,
-                    color = MaterialTheme.colorScheme.surface
+        ) { padding ->
+            Box(modifier = Modifier.fillMaxSize()) {
+                // YouTube ট্যাব: ওপরে statusBarsPadding() থাকায় সময়/ব্যাটারি স্পষ্ট থাকবে ও ভিডিও কাটা পড়বে না
+                Box(
+                    modifier = if (selectedTab == 0) {
+                        Modifier
+                            .fillMaxSize()
+                            .background(Color.Black)
+                            .then(
+                                if (!isPipMode && fullscreenView == null) {
+                                    Modifier.statusBarsPadding().navigationBarsPadding()
+                                } else {
+                                    Modifier
+                                }
+                            )
+                    } else {
+                        Modifier.size(0.dp)
+                    }
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .navigationBarsPadding()
-                            .height(40.dp),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        CompactTabIcon(
-                            icon = Icons.Rounded.PlayCircle,
-                            selected = selectedTab == 0,
-                            onClick = { onTabSelected(0) }
-                        )
-                        CompactTabIcon(
-                            icon = Icons.Rounded.VideoLibrary,
-                            selected = selectedTab == 1,
-                            onClick = { onTabSelected(1) }
-                        )
-                        CompactTabIcon(
-                            icon = Icons.Rounded.MusicNote,
-                            selected = selectedTab == 2,
-                            onClick = { onTabSelected(2) }
+                    YouTubeTabScreen(
+                        activity = activity,
+                        isVisible = selectedTab == 0 && fullscreenView == null,
+                        onShowFullscreen = onShowFullscreen,
+                        onHideFullscreen = onHideFullscreen
+                    )
+                }
+
+                if (selectedTab == 1) {
+                    Box(modifier = Modifier.padding(top = padding.calculateTopPadding()).fillMaxSize()) {
+                        VideoListTabScreen()
+                    }
+                } else if (selectedTab == 2) {
+                    Box(modifier = Modifier.padding(top = padding.calculateTopPadding()).fillMaxSize()) {
+                        MuzioMusicTabScreen(
+                            isDarkTheme = isDarkTheme,
+                            currentSong = currentMusicSong,
+                            onSongChanged = { currentMusicSong = it },
+                            onFullPlayerChanged = { isMusicFullPlayerOpen = it }
                         )
                     }
                 }
             }
         }
-    ) { padding ->
-        Box(modifier = Modifier.fillMaxSize()) {
-            Box(
-                modifier = if (selectedTab == 0) {
-                    Modifier
-                        .fillMaxSize()
-                        .background(Color.Black)
-                        .then(if (!isPipMode) Modifier.padding(bottom = padding.calculateBottomPadding()) else Modifier)
-                } else {
-                    Modifier.size(0.dp)
-                }
+
+        // ফিক্সড ফ্লোটিং পিল নেভিগেশন বার (সব ট্যাবের ওপরে নিচে ভাসমান থাকবে)
+        if (!isPipMode && !isMusicFullPlayerOpen && fullscreenView == null) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 8.dp),
+                shape = RoundedCornerShape(24.dp),
+                tonalElevation = 6.dp,
+                shadowElevation = 10.dp,
+                color = if (isDarkTheme) Color(0xE6221616) else Color(0xF2FFFFFF)
             ) {
-                YouTubeTabScreen(
-                    activity = activity,
-                    isVisible = selectedTab == 0,
-                    onShowFullscreen = onShowFullscreen,
-                    onHideFullscreen = onHideFullscreen
-                )
+                Row(
+                    modifier = Modifier
+                        .height(42.dp)
+                        .padding(horizontal = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CompactTabIcon(
+                        icon = Icons.Rounded.PlayCircle,
+                        selected = selectedTab == 0,
+                        onClick = { onTabSelected(0) }
+                    )
+                    CompactTabIcon(
+                        icon = Icons.Rounded.VideoLibrary,
+                        selected = selectedTab == 1,
+                        onClick = { onTabSelected(1) }
+                    )
+                    CompactTabIcon(
+                        icon = Icons.Rounded.MusicNote,
+                        selected = selectedTab == 2,
+                        onClick = { onTabSelected(2) }
+                    )
+                }
+            }
+        }
+
+        // YouTube ফুলস্ক্রিন ওভারলে (WebView-এর ওপরেই বসবে — কোনো টাচ ব্লকার না থাকায় 10s স্কিপ ও 2x স্পিড ঠিকঠাক কাজ করবে)
+        if (fullscreenView != null) {
+            var ytLocked by remember { mutableStateOf(false) }
+
+            BackHandler {
+                if (!ytLocked) onHideFullscreen()
+                else Toast.makeText(activity, "স্ক্রিন আনলক করুন", Toast.LENGTH_SHORT).show()
             }
 
-            if (selectedTab == 1) {
-                Box(modifier = Modifier.padding(padding).fillMaxSize()) {
-                    VideoListTabScreen()
-                }
-            } else if (selectedTab == 2) {
-                Box(modifier = Modifier.padding(padding).fillMaxSize()) {
-                    MuzioMusicTabScreen(
-                        isDarkTheme = isDarkTheme,
-                        currentSong = currentMusicSong,
-                        onSongChanged = { currentMusicSong = it },
-                        onFullPlayerChanged = { isMusicFullPlayerOpen = it }
+            Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        FrameLayout(ctx).apply {
+                            (fullscreenView.parent as? ViewGroup)?.removeView(fullscreenView)
+                            addView(
+                                fullscreenView,
+                                FrameLayout.LayoutParams(
+                                    FrameLayout.LayoutParams.MATCH_PARENT,
+                                    FrameLayout.LayoutParams.MATCH_PARENT
+                                )
+                            )
+                        }
+                    }
+                )
+
+                if (ytLocked) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                detectDragGestures { _, _ -> }
+                            }
                     )
+                }
+
+                if (!isPipMode) {
+                    IconButton(
+                        onClick = { ytLocked = !ytLocked },
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .safeDrawingPadding()
+                            .padding(12.dp)
+                            .size(36.dp)
+                            .background(Color(0x77000000), CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = if (ytLocked) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+                            contentDescription = "Screen Lock",
+                            tint = if (ytLocked) Color(0xFFFFC107) else Color.White,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
             }
         }
@@ -542,16 +469,16 @@ fun MainAppContainer(
 fun CompactTabIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, selected: Boolean, onClick: () -> Unit) {
     Box(
         modifier = Modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else Color.Transparent)
+            .clip(RoundedCornerShape(18.dp))
+            .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent)
             .clickable { onClick() }
-            .padding(horizontal = 24.dp, vertical = 4.dp),
+            .padding(horizontal = 20.dp, vertical = 5.dp),
         contentAlignment = Alignment.Center
     ) {
         Icon(
             imageVector = icon,
             contentDescription = null,
-            tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),
             modifier = Modifier.size(22.dp)
         )
     }
@@ -571,9 +498,6 @@ fun YouTubeTabScreen(
     onShowFullscreen: (View, WebChromeClient.CustomViewCallback) -> Unit,
     onHideFullscreen: () -> Unit
 ) {
-    val context = LocalContext.current
-    var currentUrl by remember { mutableStateOf("https://m.youtube.com") }
-
     val bgScript = """
         (function() {
             try {
@@ -583,6 +507,14 @@ fun YouTubeTabScreen(
                 window.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
                 document.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
                 window.addEventListener('webkitvisibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
+
+                var floatStyle = document.getElementById('ultra-float-space');
+                if (!floatStyle) {
+                    floatStyle = document.createElement('style');
+                    floatStyle.id = 'ultra-float-space';
+                    floatStyle.innerHTML = 'ytm-pivot-bar-renderer { padding-bottom: 52px !important; }';
+                    document.head.appendChild(floatStyle);
+                }
 
                 function cleanUiAndTrack() {
                     document.querySelectorAll('a, button, ytm-button-renderer').forEach(function(el) {
@@ -606,103 +538,64 @@ fun YouTubeTabScreen(
         })();
     """.trimIndent()
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            update = { webView ->
-                webView.visibility = if (isVisible) View.VISIBLE else View.GONE
-            },
-            factory = { ctx ->
-                val webView = BackgroundWebView(ctx)
-                activity.activeWebView = webView
-                webView.addJavascriptInterface(
-                    YouTubeJsBridge { playing -> activity.isYouTubePlaying = playing },
-                    "UltraBridge"
-                )
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        update = { webView ->
+            webView.visibility = if (isVisible) View.VISIBLE else View.GONE
+        },
+        factory = { ctx ->
+            val webView = BackgroundWebView(ctx)
+            activity.activeWebView = webView
+            webView.addJavascriptInterface(
+                YouTubeJsBridge { playing -> activity.isYouTubePlaying = playing },
+                "UltraBridge"
+            )
 
-                val cookieManager = CookieManager.getInstance()
-                cookieManager.setAcceptCookie(true)
-                cookieManager.setAcceptThirdPartyCookies(webView, true)
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieManager.setAcceptThirdPartyCookies(webView, true)
 
-                webView.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    mediaPlaybackRequiresUserGesture = false
-                    cacheMode = WebSettings.LOAD_DEFAULT
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
+            webView.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                mediaPlaybackRequiresUserGesture = false
+                cacheMode = WebSettings.LOAD_DEFAULT
+                useWideViewPort = true
+                loadWithOverviewMode = true
+            }
+
+            webView.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val url = request?.url?.toString() ?: return false
+                    if (!url.startsWith("http://") && !url.startsWith("https://")) return true
+                    return false
                 }
 
-                webView.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                        val url = request?.url?.toString() ?: return false
-                        if (!url.startsWith("http://") && !url.startsWith("https://")) return true
-                        return false
-                    }
-
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        super.onPageFinished(view, url)
-                        if (url != null) currentUrl = url
-                        view?.evaluateJavascript(bgScript, null)
-                    }
-
-                    override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
-                        super.doUpdateVisitedHistory(view, url, isReload)
-                        if (url != null) currentUrl = url
-                        view?.evaluateJavascript(bgScript, null)
-                    }
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    view?.evaluateJavascript(bgScript, null)
                 }
 
-                webView.webChromeClient = object : WebChromeClient() {
-                    override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
-                        if (view != null && callback != null) onShowFullscreen(view, callback)
-                    }
+                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                    super.doUpdateVisitedHistory(view, url, isReload)
+                    view?.evaluateJavascript(bgScript, null)
+                }
+            }
 
-                    override fun onHideCustomView() {
-                        onHideFullscreen()
-                    }
+            webView.webChromeClient = object : WebChromeClient() {
+                override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                    if (view != null && callback != null) onShowFullscreen(view, callback)
                 }
 
-                webView.loadUrl("https://m.youtube.com")
-                webView
+                override fun onHideCustomView() {
+                    onHideFullscreen()
+                }
             }
-        )
 
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 12.dp, bottom = 12.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(Color(0xCC1E1E1E))
-                .padding(horizontal = 6.dp, vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(
-                onClick = {
-                    val linkToCopy = activity.activeWebView?.url ?: currentUrl
-                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("YouTube Link", linkToCopy))
-                    Toast.makeText(context, "লিংক কপি হয়েছে", Toast.LENGTH_SHORT).show()
-                },
-                modifier = Modifier.size(34.dp)
-            ) {
-                Icon(Icons.Rounded.ContentCopy, contentDescription = "Copy Link", tint = Color.White, modifier = Modifier.size(18.dp))
-            }
-            IconButton(
-                onClick = {
-                    val linkToShare = activity.activeWebView?.url ?: currentUrl
-                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, linkToShare)
-                    }
-                    context.startActivity(Intent.createChooser(shareIntent, "Share Link"))
-                },
-                modifier = Modifier.size(34.dp)
-            ) {
-                Icon(Icons.Rounded.Share, contentDescription = "Share Link", tint = Color(0xFFFFC107), modifier = Modifier.size(18.dp))
-            }
+            webView.loadUrl("https://m.youtube.com")
+            webView
         }
-    }
+    )
 }
 
 @Composable
@@ -764,7 +657,10 @@ fun VideoListTabScreen() {
         }
     }
 
-    LazyColumn(modifier = Modifier.fillMaxSize()) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().navigationBarsPadding(),
+        contentPadding = PaddingValues(bottom = 72.dp)
+    ) {
         itemsIndexed(videos, key = { _, item -> item.id }) { index, video ->
             var menuExpanded by remember { mutableStateOf(false) }
             ListItem(
@@ -772,6 +668,9 @@ fun VideoListTabScreen() {
                     val intent = Intent(context, VideoPlayerActivity::class.java).apply {
                         putExtra("VIDEO_URI", video.uri.toString())
                         putExtra("VIDEO_TITLE", video.title)
+                        putStringArrayListExtra("VIDEO_URIS", ArrayList(videos.map { it.uri.toString() }))
+                        putStringArrayListExtra("VIDEO_TITLES", ArrayList(videos.map { it.title }))
+                        putExtra("VIDEO_INDEX", index)
                     }
                     context.startActivity(intent)
                 },
@@ -864,6 +763,7 @@ fun VideoListTabScreen() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MuzioMusicTabScreen(
     isDarkTheme: Boolean,
@@ -1015,7 +915,7 @@ fun MuzioMusicTabScreen(
     val subColor = if (isDarkTheme) Color.LightGray else Color(0xFF666666)
     val accentColor = if (isDarkTheme) Color(0xFFFFC107) else Color(0xFFD32F2F)
     val iconBoxColor = if (isDarkTheme) Color(0xFF3A2424) else Color(0xFFEDE2E2)
-    val miniPlayerBg = if (isDarkTheme) Color(0xFF261717) else Color(0xFFEAE3E3)
+    val miniPlayerBg = if (isDarkTheme) Color(0xFF2A1919) else Color(0xFFEBE4E4)
 
     Box(modifier = Modifier.fillMaxSize().background(bgBrush)) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -1068,8 +968,8 @@ fun MuzioMusicTabScreen(
                 }
             } else {
                 LazyColumn(
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(bottom = 90.dp)
+                    modifier = Modifier.weight(1f).navigationBarsPadding(),
+                    contentPadding = PaddingValues(bottom = 140.dp)
                 ) {
                     itemsIndexed(displayedSongs, key = { _, item -> item.id }) { index, song ->
                         var menuExpanded by remember { mutableStateOf(false) }
@@ -1146,13 +1046,13 @@ fun MuzioMusicTabScreen(
             }
         }
 
+        // ফ্লোটিং Play / Pause বাটন (শাফেল আইকনের বদলে)
         FloatingActionButton(
             onClick = {
-                if (displayedSongs.isNotEmpty()) {
-                    val pool = if (displayedSongs.size > 1 && currentSong != null) {
-                        displayedSongs.filter { it.id != currentSong.id }
-                    } else displayedSongs
-                    playSong(pool.random())
+                if (currentSong != null) {
+                    if (isPlaying) mediaController?.pause() else mediaController?.play()
+                } else if (displayedSongs.isNotEmpty()) {
+                    playSong(displayedSongs.first())
                 }
             },
             containerColor = accentColor,
@@ -1160,20 +1060,29 @@ fun MuzioMusicTabScreen(
             shape = CircleShape,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 20.dp, bottom = if (currentSong != null) 78.dp else 20.dp)
+                .navigationBarsPadding()
+                .padding(end = 18.dp, bottom = if (currentSong != null) 124.dp else 64.dp)
         ) {
-            Icon(Icons.Rounded.Shuffle, contentDescription = "Shuffle")
+            Icon(
+                imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                contentDescription = "Play / Pause",
+                modifier = Modifier.size(28.dp)
+            )
         }
 
+        // মিনি-প্লেয়ার বার (ফ্লোটিং নেভিগেশন পিলের ঠিক ওপরে)
         currentSong?.let { song ->
             val miniArt = rememberEmbeddedAlbumArt(context, song.uri)
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(start = 10.dp, end = 10.dp, bottom = 58.dp)
                     .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
                     .background(miniPlayerBg)
                     .clickable { showFullPlayer = true }
-                    .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                    .padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
@@ -1412,6 +1321,7 @@ fun MuzioMusicTabScreen(
             )
         }
 
+        // লাইভ স্লাইডার আপডেট ও Custom প্রিসেটসহ Equalizer ডায়ালগ
         if (showEqualizer) {
             AlertDialog(
                 onDismissRequest = { showEqualizer = false },
@@ -1422,50 +1332,81 @@ fun MuzioMusicTabScreen(
                     if (eq == null) {
                         Text("ইকুলাইজার সক্রিয় করতে আগে যেকোনো একটি গান চালু করুন।")
                     } else {
-                        Column(modifier = Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState())) {
-                            val presetCount = eq.numberOfPresets.toInt().coerceAtMost(5)
-                            if (presetCount > 0) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    for (p in 0 until presetCount) {
-                                        val name = eq.getPresetName(p.toShort())
-                                        AssistChip(
-                                            onClick = {
-                                                eq.usePreset(p.toShort())
-                                                Toast.makeText(context, "Preset: $name", Toast.LENGTH_SHORT).show()
-                                            },
-                                            label = { Text(name, fontSize = 10.sp) }
-                                        )
-                                    }
+                        val bands = eq.numberOfBands.toInt()
+                        val range = eq.bandLevelRange
+                        val bandLevels = remember(eq) {
+                            mutableStateListOf<Float>().apply {
+                                for (i in 0 until bands) {
+                                    add(eq.getBandLevel(i.toShort()).toFloat())
                                 }
-                                Spacer(modifier = Modifier.height(8.dp))
                             }
+                        }
+                        var selectedPreset by remember(eq) {
+                            mutableIntStateOf(
+                                try { eq.currentPreset.toInt() } catch (_: Exception) { -1 }
+                            )
+                        }
+                        var bassStrength by remember(bass) {
+                            mutableFloatStateOf(
+                                if (bass != null && bass.strengthSupported) bass.roundedStrength.toFloat() else 0f
+                            )
+                        }
+
+                        Column(modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                            val presetCount = eq.numberOfPresets.toInt().coerceAtMost(6)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                for (p in 0 until presetCount) {
+                                    val name = eq.getPresetName(p.toShort())
+                                    FilterChip(
+                                        selected = selectedPreset == p,
+                                        onClick = {
+                                            try {
+                                                eq.usePreset(p.toShort())
+                                                selectedPreset = p
+                                                for (i in 0 until bands) {
+                                                    bandLevels[i] = eq.getBandLevel(i.toShort()).toFloat()
+                                                }
+                                            } catch (_: Exception) { }
+                                        },
+                                        label = { Text(name, fontSize = 11.sp) }
+                                    )
+                                }
+                                FilterChip(
+                                    selected = selectedPreset == -1,
+                                    onClick = { selectedPreset = -1 },
+                                    label = { Text("Custom", fontSize = 11.sp) }
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
 
                             if (bass != null && bass.strengthSupported) {
-                                var bassStrength by remember { mutableFloatStateOf(bass.roundedStrength.toFloat()) }
                                 Text("Bass Boost (${(bassStrength / 10).toInt()}%)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 Slider(
                                     value = bassStrength,
                                     valueRange = 0f..1000f,
                                     onValueChange = {
                                         bassStrength = it
+                                        selectedPreset = -1
                                         bass.setStrength(it.toInt().toShort())
                                     }
                                 )
                             }
 
-                            val bands = eq.numberOfBands.toInt()
-                            val range = eq.bandLevelRange
                             for (i in 0 until bands) {
-                                var level by remember { mutableFloatStateOf(eq.getBandLevel(i.toShort()).toFloat()) }
-                                Text("${eq.getCenterFreq(i.toShort()) / 1000} Hz", fontSize = 12.sp)
+                                val freqHz = eq.getCenterFreq(i.toShort()) / 1000
+                                val freqLabel = if (freqHz >= 1000) "${freqHz / 1000} kHz" else "$freqHz Hz"
+                                Text(freqLabel, fontSize = 12.sp)
                                 Slider(
-                                    value = level,
+                                    value = bandLevels[i],
                                     valueRange = range[0].toFloat()..range[1].toFloat(),
                                     onValueChange = {
-                                        level = it
+                                        bandLevels[i] = it
+                                        selectedPreset = -1
                                         eq.setBandLevel(i.toShort(), it.toInt().toShort())
                                     }
                                 )
