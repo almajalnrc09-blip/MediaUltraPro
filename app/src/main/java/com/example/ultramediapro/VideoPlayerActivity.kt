@@ -499,4 +499,191 @@ fun VlcStylePlayerScreen(
                                 when (zoomMode) {
                                     0 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT); overlayText = "Best Fit" }
                                     1 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN); overlayText = "Fit Screen" }
-                                    2 -> { mediaPlayer.setVideoScale(Media
+                                    2 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9); overlayText = "16:9" }
+                                }
+                            }, modifier = Modifier.size(34.dp)) {
+                                Icon(Icons.Rounded.AspectRatio, contentDescription = "Zoom", tint = Color.White, modifier = Modifier.size(19.dp))
+                            }
+                        }
+
+                        IconButton(
+                            onClick = {
+                                if (mediaPlayer.isPlaying) {
+                                    mediaPlayer.pause()
+                                    isPlaying = false
+                                } else {
+                                    mediaPlayer.play()
+                                    isPlaying = true
+                                }
+                            },
+                            modifier = Modifier.size(40.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isPlaying) Icons.Rounded.PauseCircleOutline else Icons.Rounded.PlayCircleOutline,
+                                contentDescription = "Play/Pause",
+                                tint = Color.White,
+                                modifier = Modifier.size(36.dp)
+                            )
+                        }
+
+                        Row {
+                            IconButton(onClick = {
+                                val act = context as ComponentActivity
+                                val isNowLandscape = act.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                                if (isNowLandscape) {
+                                    act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                    overlayText = "Portrait"
+                                } else {
+                                    act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                                    overlayText = "Landscape"
+                                }
+                            }, modifier = Modifier.size(34.dp)) {
+                                Icon(Icons.Rounded.ScreenRotation, contentDescription = "Rotate", tint = Color.White, modifier = Modifier.size(19.dp))
+                            }
+                            IconButton(onClick = { showSideMenu = !showSideMenu }, modifier = Modifier.size(34.dp)) {
+                                Icon(Icons.Rounded.MoreHoriz, contentDescription = "More", tint = Color.White, modifier = Modifier.size(19.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        AnimatedVisibility(
+            visible = showSideMenu && !isLocked && !isPipMode,
+            enter = slideInHorizontally(initialOffsetX = { it }),
+            exit = slideOutHorizontally(targetOffsetX = { it }),
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .safeDrawingPadding()
+                .padding(vertical = 12.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .width(245.dp)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp))
+                    .background(Color(0xEE1E1A17))
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                SideMenuItem(Icons.Rounded.LockOpen, "Lock") { isLocked = true; showSideMenu = false }
+                SideMenuItem(Icons.Rounded.Bedtime, "Sleep timer") { showSleepDialog = true; showSideMenu = false }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.Speed, contentDescription = null, tint = Color.White, modifier = Modifier.size(22.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = speedLabel,
+                            color = if (currentSpeed == 1.0f) Color.White else Color(0xFFFF8800),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clickable {
+                                speedIdx = 2
+                                mediaPlayer.setRate(1.0f)
+                            }
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = {
+                                if (speedIdx > 0) {
+                                    speedIdx--
+                                    mediaPlayer.setRate(speedSteps[speedIdx])
+                                }
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Rounded.Remove, contentDescription = "Slower", tint = Color.White)
+                        }
+                        IconButton(
+                            onClick = {
+                                if (speedIdx < speedSteps.lastIndex) {
+                                    speedIdx++
+                                    mediaPlayer.setRate(speedSteps[speedIdx])
+                                }
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Rounded.Add, contentDescription = "Faster", tint = Color.White)
+                        }
+                    }
+                }
+
+                SideMenuItem(Icons.Rounded.ClosedCaption, "Load .srt subtitle") { showSideMenu = false; onPickSubtitle() }
+                SideMenuItem(Icons.Rounded.HistoryToggleOff, "Jump to Time") { showJumpDialog = true; showSideMenu = false }
+                SideMenuItem(Icons.Rounded.Headphones, "Play as audio") { onPlayAsAudio(); showSideMenu = false }
+                SideMenuItem(Icons.Rounded.PictureInPictureAlt, "Pop-Up player") { showSideMenu = false; onEnterPip() }
+            }
+        }
+
+        if (showSleepDialog && !isPipMode) {
+            AlertDialog(
+                onDismissRequest = { showSleepDialog = false },
+                title = { Text("Sleep Timer") },
+                text = {
+                    Column {
+                        listOf(0 to "Off", 15 to "15 Minutes", 30 to "30 Minutes", 45 to "45 Minutes", 60 to "60 Minutes").forEach { (mins, text) ->
+                            TextButton(
+                                onClick = { onSetSleepTimer(mins); showSleepDialog = false },
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text(text) }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showSleepDialog = false }) { Text("Cancel") } }
+            )
+        }
+
+        if (showJumpDialog && !isPipMode) {
+            AlertDialog(
+                onDismissRequest = { showJumpDialog = false },
+                title = { Text("Jump to Time") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
+                            Button(onClick = { mediaPlayer.setTime((mediaPlayer.time - 60000).coerceAtLeast(0)) }) { Text("-1m") }
+                            Button(onClick = { mediaPlayer.setTime((mediaPlayer.time + 60000).coerceAtMost(mediaPlayer.length)) }) { Text("+1m") }
+                        }
+                        Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
+                            Button(onClick = { mediaPlayer.setTime((mediaPlayer.time - 300000).coerceAtLeast(0)) }) { Text("-5m") }
+                            Button(onClick = { mediaPlayer.setTime((mediaPlayer.time + 300000).coerceAtMost(mediaPlayer.length)) }) { Text("+5m") }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showJumpDialog = false }) { Text("Done") } }
+            )
+        }
+    }
+}
+
+@Composable
+fun SideMenuItem(icon: ImageVector, label: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = label, tint = Color.White, modifier = Modifier.size(22.dp))
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(label, color = Color.White, fontSize = 14.sp)
+    }
+}
+
+fun formatMillis(ms: Long): String {
+    if (ms <= 0) return "00:00"
+    val totalSecs = ms / 1000
+    val hrs = totalSecs / 3600
+    val mins = (totalSecs % 3600) / 60
+    val secs = totalSecs % 60
+    return if (hrs > 0) String.format("%d:%02d:%02d", hrs, mins, secs)
+    else String.format("%02d:%02d", mins, secs)
+}
