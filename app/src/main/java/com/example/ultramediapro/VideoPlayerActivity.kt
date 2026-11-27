@@ -2,10 +2,8 @@ package com.example.ultramediapro
 
 import android.app.AlertDialog
 import android.app.PictureInPictureParams
-import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
-import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -497,9 +495,18 @@ fun VlcStylePlayerScreen(
                             IconButton(onClick = {
                                 zoomMode = (zoomMode + 1) % 3
                                 when (zoomMode) {
-                                    0 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT); overlayText = "Best Fit" }
-                                    1 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN); overlayText = "Fit Screen" }
-                                    2 -> { mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9); overlayText = "16:9" }
+                                    0 -> {
+                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT)
+                                        overlayText = "Best Fit"
+                                    }
+                                    1 -> {
+                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_FIT_SCREEN)
+                                        overlayText = "Fit Screen"
+                                    }
+                                    2 -> {
+                                        mediaPlayer.setVideoScale(MediaPlayer.ScaleType.SURFACE_16_9)
+                                        overlayText = "16:9"
+                                    }
                                 }
                             }, modifier = Modifier.size(34.dp)) {
                                 Icon(Icons.Rounded.AspectRatio, contentDescription = "Zoom", tint = Color.White, modifier = Modifier.size(19.dp))
