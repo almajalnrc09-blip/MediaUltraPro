@@ -3,11 +3,15 @@ package com.example.ultramediapro
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.PendingIntent
 import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -23,6 +27,8 @@ import android.provider.MediaStore
 import android.util.Rational
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsetsController
+import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -63,7 +69,6 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -94,32 +99,63 @@ class MainActivity : ComponentActivity() {
 
     private var selectedTab by mutableIntStateOf(0)
     private var isPipMode by mutableStateOf(false)
+    private var isMusicFullPlayerOpen by mutableStateOf(false)
+    private var lastIsDarkTheme: Boolean = false
     @Volatile var isYouTubePlaying: Boolean = false
     var activeWebView: BackgroundWebView? = null
     var customFullscreenView by mutableStateOf<View?>(null)
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
 
+    private val ytActionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                YouTubeBackgroundService.ACTION_YT_TOGGLE_PLAY -> {
+                    activeWebView?.onResume()
+                    activeWebView?.resumeTimers()
+                    activeWebView?.evaluateJavascript(
+                        """
+                        (function() {
+                            var v = document.querySelector('video');
+                            if (v) {
+                                if (v.paused) { v.play().catch(function(){}); }
+                                else { v.pause(); }
+                            }
+                        })();
+                        """.trimIndent(), null
+                    )
+                    isYouTubePlaying = !isYouTubePlaying
+                    updatePipParamsIfNeeded()
+                    startOrUpdateYouTubeNotification(isYouTubePlaying)
+                }
+                YouTubeBackgroundService.ACTION_YT_STOP_BG -> {
+                    activeWebView?.evaluateJavascript(
+                        "var v = document.querySelector('video'); if (v) { v.pause(); }",
+                        null
+                    )
+                    isYouTubePlaying = false
+                    stopService(Intent(this@MainActivity, YouTubeBackgroundService::class.java))
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.statusBarColor = android.graphics.Color.TRANSPARENT
-        window.navigationBarColor = android.graphics.Color.TRANSPARENT
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
-        setContent {
-            // ফোনের সিস্টেম থিম (Dark / Light / Power Saving) অনুযায়ী স্বয়ংক্রিয় অ্যাডাপ্টিভ থিম
-            val isDarkTheme = isSystemInDarkTheme()
-            val view = LocalView.current
+        val filter = IntentFilter().apply {
+            addAction(YouTubeBackgroundService.ACTION_YT_TOGGLE_PLAY)
+            addAction(YouTubeBackgroundService.ACTION_YT_STOP_BG)
+        }
+        ContextCompat.registerReceiver(this, ytActionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
-            SideEffect {
-                val controller = WindowInsetsControllerCompat(window, view)
-                val useDarkStatusIcons = when {
-                    customFullscreenView != null -> false
-                    selectedTab == 0 -> false // YouTube-এর কালো স্ট্যাটাস বারে সাদা আইকন
-                    else -> !isDarkTheme
-                }
-                controller.isAppearanceLightStatusBars = useDarkStatusIcons
-                controller.isAppearanceLightNavigationBars = !isDarkTheme
+        setContent {
+            val isDarkTheme = isSystemInDarkTheme()
+            lastIsDarkTheme = isDarkTheme
+
+            LaunchedEffect(selectedTab, isDarkTheme, customFullscreenView, isMusicFullPlayerOpen) {
+                applySystemBarAppearance(isDarkTheme)
             }
 
             val colorScheme = if (isDarkTheme) {
@@ -143,6 +179,8 @@ class MainActivity : ComponentActivity() {
                     onTabSelected = { selectedTab = it },
                     isDarkTheme = isDarkTheme,
                     isPipMode = isPipMode,
+                    isMusicFullPlayerOpen = isMusicFullPlayerOpen,
+                    onMusicFullPlayerChanged = { isMusicFullPlayerOpen = it },
                     fullscreenView = customFullscreenView,
                     onShowFullscreen = { fsView, callback ->
                         customFullscreenView = fsView
@@ -156,6 +194,47 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Light/Dark মোডে সময়, Wi-Fi ও ব্যাটারি আইকন স্পষ্ট রাখার জন্য সিস্টেম বার আপডেট
+    fun applySystemBarAppearance(isDarkTheme: Boolean) {
+        window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
+        @Suppress("DEPRECATION")
+        window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS)
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+
+        val useDarkStatusIcons = when {
+            customFullscreenView != null -> false
+            selectedTab == 0 -> false // YouTube কালো ব্যাকগ্রাউন্ডে সাদা আইকন
+            selectedTab == 2 && isMusicFullPlayerOpen -> false // ফুল মিউজিক প্লেয়ারে সাদা আইকন
+            else -> !isDarkTheme // Light মোডে কালো আইকন, Dark মোডে সাদা আইকন
+        }
+        val useDarkNavIcons = !isDarkTheme
+
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.isAppearanceLightStatusBars = useDarkStatusIcons
+        controller.isAppearanceLightNavigationBars = useDarkNavIcons
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+            var appearance = 0
+            if (useDarkStatusIcons) appearance = appearance or WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+            if (useDarkNavIcons) appearance = appearance or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+            window.insetsController?.setSystemBarsAppearance(appearance, mask)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            @Suppress("DEPRECATION")
+            var vis = window.decorView.systemUiVisibility
+            @Suppress("DEPRECATION")
+            vis = if (useDarkStatusIcons) {
+                vis or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+            } else {
+                vis and View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv()
+            }
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = vis
+        }
+    }
+
     fun exitYouTubeFullscreen() {
         val cb = customViewCallback
         customViewCallback = null
@@ -163,6 +242,7 @@ class MainActivity : ComponentActivity() {
         cb?.onCustomViewHidden()
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         setImmersiveMode(false)
+        applySystemBarAppearance(lastIsDarkTheme)
     }
 
     private fun setImmersiveMode(enable: Boolean) {
@@ -175,11 +255,62 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun buildYoutubePipParams(): PictureInPictureParams {
+        val toggleIntent = Intent(YouTubeBackgroundService.ACTION_YT_TOGGLE_PLAY).setPackage(packageName)
+        val togglePendingIntent = PendingIntent.getBroadcast(
+            this,
+            101,
+            toggleIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val iconRes = if (isYouTubePlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val label = if (isYouTubePlaying) "Pause" else "Play"
+        val action = RemoteAction(
+            android.graphics.drawable.Icon.createWithResource(this, iconRes),
+            label,
+            label,
+            togglePendingIntent
+        )
+        return PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(16, 9))
+            .setActions(listOf(action))
+            .build()
+    }
+
+    fun updatePipParamsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode) {
+            try {
+                setPictureInPictureParams(buildYoutubePipParams())
+            } catch (_: Exception) { }
+        }
+    }
+
+    fun startOrUpdateYouTubeNotification(playing: Boolean) {
+        try {
+            val intent = Intent(this, YouTubeBackgroundService::class.java).apply {
+                putExtra("IS_PLAYING", playing)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (_: Exception) { }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && !isPipMode) {
+            applySystemBarAppearance(lastIsDarkTheme)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         stopService(Intent(this, YouTubeBackgroundService::class.java))
         activeWebView?.onResume()
         activeWebView?.resumeTimers()
+        applySystemBarAppearance(lastIsDarkTheme)
     }
 
     override fun onPause() {
@@ -187,14 +318,16 @@ class MainActivity : ComponentActivity() {
         if (selectedTab == 0 && (isYouTubePlaying || customFullscreenView != null)) {
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
-            try {
-                val intent = Intent(this, YouTubeBackgroundService::class.java)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(intent)
-                } else {
-                    startService(intent)
-                }
-            } catch (_: Exception) { }
+            startOrUpdateYouTubeNotification(true)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (selectedTab == 0 && (isYouTubePlaying || customFullscreenView != null)) {
+            activeWebView?.onResume()
+            activeWebView?.resumeTimers()
+            startOrUpdateYouTubeNotification(true)
         }
     }
 
@@ -203,27 +336,27 @@ class MainActivity : ComponentActivity() {
         if (selectedTab == 0 && (isYouTubePlaying || customFullscreenView != null) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             activeWebView?.onResume()
             activeWebView?.resumeTimers()
-            // PiP-এ যাওয়ার আগে অপ্রয়োজনীয় হেডার/কমেন্ট লুকিয়ে ভিডিও ফ্রেম ওপরে আনা
-            activeWebView?.evaluateJavascript(
-                """
-                (function() {
-                    var s = document.getElementById('ultra-pip-css');
-                    if (!s) {
-                        s = document.createElement('style');
-                        s.id = 'ultra-pip-css';
-                        s.innerHTML = 'ytm-mobile-topbar-renderer, .watch-below-the-player, ytm-pivot-bar-renderer, .related-items-container { display: none !important; } body { background: #000 !important; }';
-                        document.head.appendChild(s);
-                    }
-                    window.scrollTo(0, 0);
-                    var v = document.querySelector('video');
-                    if (v && v.paused) { v.play().catch(function(){}); }
-                })();
-                """.trimIndent(), null
-            )
-            try {
-                enterPictureInPictureMode(
-                    PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()
+            if (customFullscreenView == null) {
+                activeWebView?.evaluateJavascript(
+                    """
+                    (function() {
+                        var s = document.getElementById('ultra-pip-css');
+                        if (!s) {
+                            s = document.createElement('style');
+                            s.id = 'ultra-pip-css';
+                            s.innerHTML = 'html, body { width: 100vw !important; height: 100vh !important; min-width: 0 !important; margin: 0 !important; padding: 0 !important; overflow: hidden !important; background: #000 !important; } ' +
+                                'ytm-mobile-topbar-renderer, .watch-below-the-player, ytm-pivot-bar-renderer, .related-items-container, .player-controls-content, ytm-custom-control, .ytp-chrome-top, .ytp-chrome-bottom { display: none !important; } ' +
+                                '#player-container-id, .player-container, .html5-video-player, video.html5-main-video, video { position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; object-fit: contain !important; background: #000 !important; z-index: 2147483647 !important; }';
+                            document.head.appendChild(s);
+                        }
+                        var v = document.querySelector('video');
+                        if (v && v.paused) { v.play().catch(function(){}); }
+                    })();
+                    """.trimIndent(), null
                 )
+            }
+            try {
+                enterPictureInPictureMode(buildYoutubePipParams())
             } catch (_: Exception) { }
         }
     }
@@ -244,10 +377,12 @@ class MainActivity : ComponentActivity() {
             if (customFullscreenView == null) {
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             }
+            applySystemBarAppearance(lastIsDarkTheme)
         }
     }
 
     override fun onDestroy() {
+        try { unregisterReceiver(ytActionReceiver) } catch (_: Exception) { }
         stopService(Intent(this, YouTubeBackgroundService::class.java))
         super.onDestroy()
     }
@@ -261,11 +396,12 @@ fun MainAppContainer(
     onTabSelected: (Int) -> Unit,
     isDarkTheme: Boolean,
     isPipMode: Boolean,
+    isMusicFullPlayerOpen: Boolean,
+    onMusicFullPlayerChanged: (Boolean) -> Unit,
     fullscreenView: View?,
     onShowFullscreen: (View, WebChromeClient.CustomViewCallback) -> Unit,
     onHideFullscreen: () -> Unit
 ) {
-    var isMusicFullPlayerOpen by remember { mutableStateOf(false) }
     var currentMusicSong by remember { mutableStateOf<MediaFile?>(null) }
     var lastBackPressTime by remember { mutableLongStateOf(0L) }
 
@@ -305,7 +441,6 @@ fun MainAppContainer(
 
     val musicTopBg = if (isDarkTheme) Color(0xFF2B1212) else MaterialTheme.colorScheme.background
 
-    // মূল রুট Box — WebView কখনোই আনমাউন্ট হবে না, তাই ফুলস্ক্রিন থেকে বের হলে আর রিফ্রেশ হবে না
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
             topBar = {
@@ -326,7 +461,7 @@ fun MainAppContainer(
             }
         ) { padding ->
             Box(modifier = Modifier.fillMaxSize()) {
-                // YouTube ট্যাব: ওপরে statusBarsPadding() থাকায় সময়/ব্যাটারি স্পষ্ট থাকবে ও ভিডিও কাটা পড়বে না
+                // YouTube ট্যাবের নিচে 52dp জায়গা রাখা হয়েছে যাতে ফ্লোটিং বার Home/Shorts/You-কে ঢেকে না দেয়
                 Box(
                     modifier = if (selectedTab == 0) {
                         Modifier
@@ -334,7 +469,10 @@ fun MainAppContainer(
                             .background(Color.Black)
                             .then(
                                 if (!isPipMode && fullscreenView == null) {
-                                    Modifier.statusBarsPadding().navigationBarsPadding()
+                                    Modifier
+                                        .statusBarsPadding()
+                                        .navigationBarsPadding()
+                                        .padding(bottom = 52.dp)
                                 } else {
                                     Modifier
                                 }
@@ -345,7 +483,7 @@ fun MainAppContainer(
                 ) {
                     YouTubeTabScreen(
                         activity = activity,
-                        isVisible = selectedTab == 0 && fullscreenView == null,
+                        isVisible = selectedTab == 0,
                         onShowFullscreen = onShowFullscreen,
                         onHideFullscreen = onHideFullscreen
                     )
@@ -361,28 +499,28 @@ fun MainAppContainer(
                             isDarkTheme = isDarkTheme,
                             currentSong = currentMusicSong,
                             onSongChanged = { currentMusicSong = it },
-                            onFullPlayerChanged = { isMusicFullPlayerOpen = it }
+                            onFullPlayerChanged = onMusicFullPlayerChanged
                         )
                     }
                 }
             }
         }
 
-        // ফিক্সড ফ্লোটিং পিল নেভিগেশন বার (সব ট্যাবের ওপরে নিচে ভাসমান থাকবে)
+        // স্লিম ফিক্সড ফ্লোটিং পিল নেভিগেশন বার
         if (!isPipMode && !isMusicFullPlayerOpen && fullscreenView == null) {
             Surface(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(bottom = 8.dp),
-                shape = RoundedCornerShape(24.dp),
+                    .padding(bottom = 6.dp),
+                shape = RoundedCornerShape(22.dp),
                 tonalElevation = 6.dp,
                 shadowElevation = 10.dp,
-                color = if (isDarkTheme) Color(0xE6221616) else Color(0xF2FFFFFF)
+                color = if (isDarkTheme) Color(0xE6221616) else Color(0xF5FFFFFF)
             ) {
                 Row(
                     modifier = Modifier
-                        .height(42.dp)
+                        .height(38.dp)
                         .padding(horizontal = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -406,7 +544,7 @@ fun MainAppContainer(
             }
         }
 
-        // YouTube ফুলস্ক্রিন ওভারলে (WebView-এর ওপরেই বসবে — কোনো টাচ ব্লকার না থাকায় 10s স্কিপ ও 2x স্পিড ঠিকঠাক কাজ করবে)
+        // YouTube ফুলস্ক্রিন ওভারলে
         if (fullscreenView != null) {
             var ytLocked by remember { mutableStateOf(false) }
 
@@ -469,17 +607,17 @@ fun MainAppContainer(
 fun CompactTabIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, selected: Boolean, onClick: () -> Unit) {
     Box(
         modifier = Modifier
-            .clip(RoundedCornerShape(18.dp))
+            .clip(RoundedCornerShape(16.dp))
             .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent)
             .clickable { onClick() }
-            .padding(horizontal = 20.dp, vertical = 5.dp),
+            .padding(horizontal = 20.dp, vertical = 4.dp),
         contentAlignment = Alignment.Center
     ) {
         Icon(
             imageVector = icon,
             contentDescription = null,
             tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),
-            modifier = Modifier.size(22.dp)
+            modifier = Modifier.size(21.dp)
         )
     }
 }
@@ -508,19 +646,20 @@ fun YouTubeTabScreen(
                 document.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
                 window.addEventListener('webkitvisibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
 
-                var floatStyle = document.getElementById('ultra-float-space');
-                if (!floatStyle) {
-                    floatStyle = document.createElement('style');
-                    floatStyle.id = 'ultra-float-space';
-                    floatStyle.innerHTML = 'ytm-pivot-bar-renderer { padding-bottom: 52px !important; }';
-                    document.head.appendChild(floatStyle);
+                var hideStyle = document.getElementById('ultra-open-app-hide');
+                if (!hideStyle) {
+                    hideStyle = document.createElement('style');
+                    hideStyle.id = 'ultra-open-app-hide';
+                    hideStyle.innerHTML = 'ytm-open-app-button, .open-app-button, a[aria-label="Open App"], button[aria-label="Open App"], ytm-promoted-sparkles-web-renderer { display: none !important; }';
+                    document.head.appendChild(hideStyle);
                 }
 
                 function cleanUiAndTrack() {
-                    document.querySelectorAll('a, button, ytm-button-renderer').forEach(function(el) {
-                        var txt = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    document.querySelectorAll('a, button, ytm-button-renderer, c3-material-button').forEach(function(el) {
+                        var txt = (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
                         if (txt === 'open app') {
-                            el.style.display = 'none';
+                            var wrap = el.closest('ytm-button-renderer, c3-material-button') || el;
+                            wrap.style.display = 'none';
                         }
                     });
                     var v = document.querySelector('video');
@@ -547,7 +686,12 @@ fun YouTubeTabScreen(
             val webView = BackgroundWebView(ctx)
             activity.activeWebView = webView
             webView.addJavascriptInterface(
-                YouTubeJsBridge { playing -> activity.isYouTubePlaying = playing },
+                YouTubeJsBridge { playing ->
+                    if (activity.isYouTubePlaying != playing) {
+                        activity.isYouTubePlaying = playing
+                        activity.updatePipParamsIfNeeded()
+                    }
+                },
                 "UltraBridge"
             )
 
@@ -782,6 +926,7 @@ fun MuzioMusicTabScreen(
     var favoriteIds by remember {
         mutableStateOf(prefs.getStringSet("fav_ids", emptySet())?.toSet() ?: emptySet())
     }
+    var customQueueOrder by remember { mutableStateOf<List<Long>>(emptyList()) }
 
     var mediaController by remember { mutableStateOf<MediaController?>(null) }
     var isPlaying by remember { mutableStateOf(false) }
@@ -843,6 +988,83 @@ fun MuzioMusicTabScreen(
         }
     }
 
+    fun playSong(song: MediaFile) {
+        onSongChanged(song)
+        mediaController?.apply {
+            setMediaItem(MediaItem.fromUri(song.uri))
+            prepare()
+            play()
+        }
+    }
+
+    val displayedSongs = remember(songs, searchQuery, selectedCategory, favoriteIds) {
+        val base = when (selectedCategory) {
+            1 -> songs.filter { favoriteIds.contains(it.id.toString()) }
+            2 -> songs.sortedBy { it.artist.lowercase() }
+            3 -> songs.sortedBy { it.album.lowercase() }
+            else -> songs
+        }
+        if (searchQuery.isBlank()) base
+        else base.filter {
+            it.title.contains(searchQuery, ignoreCase = true) ||
+                it.artist.contains(searchQuery, ignoreCase = true)
+        }
+    }
+
+    // Playing Queue-তে সাজানো অর্ডার অনুযায়ী গানের তালিকা
+    val orderedQueue = remember(displayedSongs, customQueueOrder) {
+        if (customQueueOrder.isEmpty()) {
+            displayedSongs
+        } else {
+            val map = displayedSongs.associateBy { it.id }
+            val arranged = customQueueOrder.mapNotNull { map[it] }
+            val remaining = displayedSongs.filter { it.id !in customQueueOrder }
+            arranged + remaining
+        }
+    }
+
+    fun moveQueueItem(fromIndex: Int, toIndex: Int) {
+        val currentIds = orderedQueue.map { it.id }.toMutableList()
+        if (fromIndex in currentIds.indices && toIndex in currentIds.indices) {
+            val moved = currentIds.removeAt(fromIndex)
+            currentIds.add(toIndex, moved)
+            customQueueOrder = currentIds
+        }
+    }
+
+    val latestQueue by rememberUpdatedState(orderedQueue)
+    val latestSong by rememberUpdatedState(currentSong)
+    val latestShuffle by rememberUpdatedState(shuffleEnabled)
+    val latestRepeat by rememberUpdatedState(repeatMode)
+
+    // একটি গান শেষ হলে কিউ-এর সাজানো পরের গানটি অটোমেটিক চালানো
+    DisposableEffect(mediaController) {
+        val ctrl = mediaController
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_ENDED && latestRepeat != Player.REPEAT_MODE_ONE) {
+                    val queue = latestQueue
+                    val cur = latestSong
+                    if (queue.isNotEmpty() && cur != null) {
+                        val next = if (latestShuffle && queue.size > 1) {
+                            queue.filter { it.id != cur.id }.random()
+                        } else {
+                            val idx = queue.indexOfFirst { it.id == cur.id }
+                            if (idx in queue.indices && idx + 1 < queue.size) {
+                                queue[idx + 1]
+                            } else if (latestRepeat == Player.REPEAT_MODE_ALL) {
+                                queue.first()
+                            } else null
+                        }
+                        if (next != null) playSong(next)
+                    }
+                }
+            }
+        }
+        ctrl?.addListener(listener)
+        onDispose { ctrl?.removeListener(listener) }
+    }
+
     LaunchedEffect(mediaController) {
         while (true) {
             mediaController?.let { ctrl ->
@@ -851,15 +1073,6 @@ fun MuzioMusicTabScreen(
                 totalDur = ctrl.duration.coerceAtLeast(1L)
             }
             delay(400)
-        }
-    }
-
-    fun playSong(song: MediaFile) {
-        onSongChanged(song)
-        mediaController?.apply {
-            setMediaItem(MediaItem.fromUri(song.uri))
-            prepare()
-            play()
         }
     }
 
@@ -890,20 +1103,6 @@ fun MuzioMusicTabScreen(
         val updated = if (favoriteIds.contains(idStr)) favoriteIds - idStr else favoriteIds + idStr
         favoriteIds = updated
         prefs.edit().putStringSet("fav_ids", updated).apply()
-    }
-
-    val displayedSongs = remember(songs, searchQuery, selectedCategory, favoriteIds) {
-        val base = when (selectedCategory) {
-            1 -> songs.filter { favoriteIds.contains(it.id.toString()) }
-            2 -> songs.sortedBy { it.artist.lowercase() }
-            3 -> songs.sortedBy { it.album.lowercase() }
-            else -> songs
-        }
-        if (searchQuery.isBlank()) base
-        else base.filter {
-            it.title.contains(searchQuery, ignoreCase = true) ||
-                it.artist.contains(searchQuery, ignoreCase = true)
-        }
     }
 
     val bgBrush = if (isDarkTheme) {
@@ -943,7 +1142,7 @@ fun MuzioMusicTabScreen(
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
-                placeholder = { Text("Search ${displayedSongs.size} songs...", color = subColor) },
+                placeholder = { Text("Search ${orderedQueue.size} songs...", color = subColor) },
                 leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, tint = accentColor) },
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = titleColor,
@@ -958,7 +1157,7 @@ fun MuzioMusicTabScreen(
                 shape = RoundedCornerShape(24.dp)
             )
 
-            if (displayedSongs.isEmpty()) {
+            if (orderedQueue.isEmpty()) {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Text(
                         if (selectedCategory == 1) "কোনো Favorite গান নেই" else "কোনো অডিও পাওয়া যায়নি",
@@ -971,7 +1170,7 @@ fun MuzioMusicTabScreen(
                     modifier = Modifier.weight(1f).navigationBarsPadding(),
                     contentPadding = PaddingValues(bottom = 140.dp)
                 ) {
-                    itemsIndexed(displayedSongs, key = { _, item -> item.id }) { index, song ->
+                    itemsIndexed(orderedQueue, key = { _, item -> item.id }) { index, song ->
                         var menuExpanded by remember { mutableStateOf(false) }
                         val coverArt = rememberEmbeddedAlbumArt(context, song.uri)
                         ListItem(
@@ -1046,13 +1245,12 @@ fun MuzioMusicTabScreen(
             }
         }
 
-        // ফ্লোটিং Play / Pause বাটন (শাফেল আইকনের বদলে)
         FloatingActionButton(
             onClick = {
                 if (currentSong != null) {
                     if (isPlaying) mediaController?.pause() else mediaController?.play()
-                } else if (displayedSongs.isNotEmpty()) {
-                    playSong(displayedSongs.first())
+                } else if (orderedQueue.isNotEmpty()) {
+                    playSong(orderedQueue.first())
                 }
             },
             containerColor = accentColor,
@@ -1061,7 +1259,7 @@ fun MuzioMusicTabScreen(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .navigationBarsPadding()
-                .padding(end = 18.dp, bottom = if (currentSong != null) 124.dp else 64.dp)
+                .padding(end = 18.dp, bottom = if (currentSong != null) 120.dp else 60.dp)
         ) {
             Icon(
                 imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
@@ -1070,14 +1268,13 @@ fun MuzioMusicTabScreen(
             )
         }
 
-        // মিনি-প্লেয়ার বার (ফ্লোটিং নেভিগেশন পিলের ঠিক ওপরে)
         currentSong?.let { song ->
             val miniArt = rememberEmbeddedAlbumArt(context, song.uri)
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(start = 10.dp, end = 10.dp, bottom = 58.dp)
+                    .padding(start = 10.dp, end = 10.dp, bottom = 54.dp)
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
                     .background(miniPlayerBg)
@@ -1230,9 +1427,9 @@ fun MuzioMusicTabScreen(
                         }
 
                         IconButton(onClick = {
-                            if (displayedSongs.isNotEmpty()) {
-                                val idx = displayedSongs.indexOfFirst { it.id == song.id }
-                                val prev = if (idx > 0) displayedSongs[idx - 1] else displayedSongs.last()
+                            if (orderedQueue.isNotEmpty()) {
+                                val idx = orderedQueue.indexOfFirst { it.id == song.id }
+                                val prev = if (idx > 0) orderedQueue[idx - 1] else orderedQueue.last()
                                 playSong(prev)
                             }
                         }) {
@@ -1252,10 +1449,12 @@ fun MuzioMusicTabScreen(
                         }
 
                         IconButton(onClick = {
-                            if (displayedSongs.isNotEmpty()) {
-                                val next = if (shuffleEnabled) displayedSongs.random() else {
-                                    val idx = displayedSongs.indexOfFirst { it.id == song.id }
-                                    displayedSongs[(idx + 1) % displayedSongs.size]
+                            if (orderedQueue.isNotEmpty()) {
+                                val next = if (shuffleEnabled && orderedQueue.size > 1) {
+                                    orderedQueue.filter { it.id != song.id }.random()
+                                } else {
+                                    val idx = orderedQueue.indexOfFirst { it.id == song.id }
+                                    orderedQueue[(idx + 1) % orderedQueue.size]
                                 }
                                 playSong(next)
                             }
@@ -1293,27 +1492,59 @@ fun MuzioMusicTabScreen(
             )
         }
 
+        // Playing Queue ডায়ালগ — ওপরে (↑) ও নিচে (↓) সরিয়ে সিরিয়াল বদলানোর সুবিধাসহ
         if (showQueueDialog) {
             AlertDialog(
                 onDismissRequest = { showQueueDialog = false },
-                title = { Text("Playing Queue (${displayedSongs.size})") },
+                title = { Text("Playing Queue (${orderedQueue.size})") },
                 text = {
-                    LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
-                        itemsIndexed(displayedSongs, key = { _, item -> item.id }) { idx, s ->
-                            Text(
-                                text = "${idx + 1}. ${s.title}",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = if (s.id == currentSong?.id) FontWeight.Bold else FontWeight.Normal,
-                                color = if (s.id == currentSong?.id) accentColor else MaterialTheme.colorScheme.onSurface,
+                    LazyColumn(modifier = Modifier.heightIn(max = 340.dp)) {
+                        itemsIndexed(orderedQueue, key = { _, item -> item.id }) { idx, s ->
+                            Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable {
-                                        playSong(s)
-                                        showQueueDialog = false
-                                    }
-                                    .padding(vertical = 10.dp)
-                            )
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "${idx + 1}. ${s.title}",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    fontSize = 14.sp,
+                                    fontWeight = if (s.id == currentSong?.id) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (s.id == currentSong?.id) accentColor else MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable {
+                                            playSong(s)
+                                            showQueueDialog = false
+                                        }
+                                        .padding(vertical = 6.dp)
+                                )
+                                IconButton(
+                                    onClick = { moveQueueItem(idx, idx - 1) },
+                                    enabled = idx > 0,
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.KeyboardArrowUp,
+                                        contentDescription = "Move Up",
+                                        tint = if (idx > 0) MaterialTheme.colorScheme.onSurface else Color.Gray.copy(alpha = 0.35f)
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { moveQueueItem(idx, idx + 1) },
+                                    enabled = idx < orderedQueue.lastIndex,
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.KeyboardArrowDown,
+                                        contentDescription = "Move Down",
+                                        tint = if (idx < orderedQueue.lastIndex) MaterialTheme.colorScheme.onSurface else Color.Gray.copy(alpha = 0.35f)
+                                    )
+                                }
+                            }
+                            HorizontalDivider(thickness = 0.5.dp, color = Color.Gray.copy(alpha = 0.2f))
                         }
                     }
                 },
@@ -1321,7 +1552,6 @@ fun MuzioMusicTabScreen(
             )
         }
 
-        // লাইভ স্লাইডার আপডেট ও Custom প্রিসেটসহ Equalizer ডায়ালগ
         if (showEqualizer) {
             AlertDialog(
                 onDismissRequest = { showEqualizer = false },
