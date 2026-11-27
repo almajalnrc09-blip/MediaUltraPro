@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.ultramediapro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 14
-        versionName = "14.3"
+        versionCode = 23
+        versionName = "23.5"
     }
 
     buildFeatures {
