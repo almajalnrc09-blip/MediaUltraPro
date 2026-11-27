@@ -3,6 +3,7 @@ package com.example.ultramediapro
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -86,7 +87,7 @@ class MusicPlaybackService : MediaSessionService() {
     }
 }
 
-// YouTube স্ক্রিন লক ও ব্যাকগ্রাউন্ডে চালানোর জন্য হালকা Foreground Service
+// YouTube ব্যাকগ্রাউন্ড সার্ভিস (নোটিফিকেশনে ট্যাপ করলেই মেইন অ্যাপ খুলবে)
 class YouTubeBackgroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -102,10 +103,21 @@ class YouTubeBackgroundService : Service() {
             manager.createNotificationChannel(channel)
         }
 
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            this.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         val notification = Notification.Builder(this, channelId)
             .setContentTitle("MediaUltraPro")
-            .setContentText("YouTube ব্যাকগ্রাউন্ডে চলছে")
+            .setContentText("YouTube ব্যাকগ্রাউন্ডে চলছে — খুলতে ট্যাপ করুন")
             .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()
 
