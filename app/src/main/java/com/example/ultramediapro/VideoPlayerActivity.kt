@@ -13,6 +13,7 @@ import android.util.Rational
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -22,6 +23,7 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -35,12 +37,16 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -53,6 +59,7 @@ import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 class VideoPlayerActivity : ComponentActivity() {
 
@@ -229,7 +236,6 @@ class VideoPlayerActivity : ComponentActivity() {
         } catch (_: Exception) { }
     }
 
-    // অন্য অ্যাপ বা ব্যাকগ্রাউন্ড থেকে ফিরলে ভিডিও সারফেস রি-অ্যাটাচ (কালো স্ক্রিন ফিক্স)
     override fun onStart() {
         super.onStart()
         isBackgroundAudioMode = false
@@ -322,6 +328,89 @@ class VideoPlayerActivity : ComponentActivity() {
 }
 
 @Composable
+fun SlimVideoSeekBar(
+    currentTime: Long,
+    totalDuration: Long,
+    onSeekPreview: (Long) -> Unit,
+    onSeekCommit: (Long) -> Unit,
+    onDragStateChanged: (Boolean) -> Unit
+) {
+    var barWidthPx by remember { mutableIntStateOf(1) }
+    var isDragging by remember { mutableStateOf(false) }
+    var dragFraction by remember { mutableFloatStateOf(0f) }
+
+    val safeTotal = totalDuration.coerceAtLeast(1L)
+    val displayFraction = if (isDragging) dragFraction else (currentTime.toFloat() / safeTotal.toFloat()).coerceIn(0f, 1f)
+    val thumbSizeDp = if (isDragging) 14.dp else 11.dp
+    val density = LocalDensity.current
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(26.dp)
+            .onSizeChanged { barWidthPx = it.width.coerceAtLeast(1) }
+            .pointerInput(safeTotal) {
+                detectTapGestures { offset ->
+                    val frac = (offset.x / barWidthPx.toFloat()).coerceIn(0f, 1f)
+                    onSeekCommit((frac * safeTotal).toLong())
+                }
+            }
+            .pointerInput(safeTotal) {
+                detectHorizontalDragGestures(
+                    onDragStart = { offset ->
+                        isDragging = true
+                        onDragStateChanged(true)
+                        val frac = (offset.x / barWidthPx.toFloat()).coerceIn(0f, 1f)
+                        dragFraction = frac
+                        onSeekPreview((frac * safeTotal).toLong())
+                    },
+                    onHorizontalDrag = { change, _ ->
+                        change.consume()
+                        val frac = (change.position.x / barWidthPx.toFloat()).coerceIn(0f, 1f)
+                        dragFraction = frac
+                        onSeekPreview((frac * safeTotal).toLong())
+                    },
+                    onDragEnd = {
+                        val target = (dragFraction * safeTotal).toLong()
+                        isDragging = false
+                        onDragStateChanged(false)
+                        onSeekCommit(target)
+                    },
+                    onDragCancel = {
+                        isDragging = false
+                        onDragStateChanged(false)
+                    }
+                )
+            },
+        contentAlignment = Alignment.CenterStart
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(3.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(Color(0x55FFFFFF))
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(displayFraction)
+                .height(3.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(Color(0xFFFF8800))
+        )
+        val thumbPx = with(density) { thumbSizeDp.toPx() }
+        val offsetX = ((barWidthPx * displayFraction) - thumbPx / 2f)
+            .coerceIn(0f, (barWidthPx - thumbPx).coerceAtLeast(0f))
+        Box(
+            modifier = Modifier
+                .offset { IntOffset(offsetX.roundToInt(), 0) }
+                .size(thumbSizeDp)
+                .background(Color(0xFFFF8800), CircleShape)
+        )
+    }
+}
+
+@Composable
 fun VlcStylePlayerScreen(
     mediaPlayer: MediaPlayer,
     videoTitle: String,
@@ -342,12 +431,15 @@ fun VlcStylePlayerScreen(
     val context = LocalContext.current
     var isPlaying by remember { mutableStateOf(true) }
     var isLocked by remember { mutableStateOf(false) }
+    var orientationBeforeLock by remember { mutableIntStateOf(ActivityInfo.SCREEN_ORIENTATION_SENSOR) }
+    var showUnlockButton by remember { mutableStateOf(false) }
     var showControls by remember { mutableStateOf(true) }
     var showSideMenu by remember { mutableStateOf(false) }
     var showSleepDialog by remember { mutableStateOf(false) }
     var showJumpDialog by remember { mutableStateOf(false) }
     var currentTime by remember { mutableLongStateOf(0L) }
     var totalDuration by remember { mutableLongStateOf(1L) }
+    var isSeeking by remember { mutableStateOf(false) }
     var overlayText by remember { mutableStateOf("") }
     var zoomMode by remember { mutableIntStateOf(0) }
     var currentVolume by remember { mutableIntStateOf(mediaPlayer.volume.coerceIn(0, 100)) }
@@ -362,15 +454,28 @@ fun VlcStylePlayerScreen(
         else -> "-${currentSpeed}x"
     }
 
+    // লক অবস্থায় ভুল করে ব্যাক চাপলেও ভিডিও বন্ধ হবে না
+    BackHandler(enabled = isLocked && !isPipMode) {
+        showUnlockButton = true
+    }
+
     LaunchedEffect(isPipMode) {
         if (isPipMode) {
             showControls = false
             showSideMenu = false
+            showUnlockButton = false
         }
     }
 
-    LaunchedEffect(showControls, showSideMenu) {
-        if (showControls && !showSideMenu) {
+    LaunchedEffect(isLocked, showUnlockButton) {
+        if (isLocked && showUnlockButton) {
+            delay(3000)
+            showUnlockButton = false
+        }
+    }
+
+    LaunchedEffect(showControls, showSideMenu, isSeeking) {
+        if (showControls && !showSideMenu && !isSeeking) {
             delay(4000)
             showControls = false
         }
@@ -381,7 +486,7 @@ fun VlcStylePlayerScreen(
             isPlaying = mediaPlayer.isPlaying
             val t = mediaPlayer.time
             val len = mediaPlayer.length
-            if (t >= 0) currentTime = t
+            if (!isSeeking && t >= 0) currentTime = t
             if (len > 0) totalDuration = len
             if (!resumeApplied && savedResumePos > 5000L && len > savedResumePos + 3000L) {
                 resumeApplied = true
@@ -399,7 +504,10 @@ fun VlcStylePlayerScreen(
             .pointerInput(isLocked, isPipMode) {
                 detectTapGestures(
                     onTap = {
-                        if (!isLocked && !isPipMode) {
+                        if (isPipMode) return@detectTapGestures
+                        if (isLocked) {
+                            showUnlockButton = !showUnlockButton
+                        } else {
                             if (showSideMenu) showSideMenu = false else showControls = !showControls
                         }
                     },
@@ -454,30 +562,52 @@ fun VlcStylePlayerScreen(
         )
 
         if (overlayText.isNotEmpty() && !isPipMode) {
-            LaunchedEffect(overlayText) {
-                delay(1400)
-                overlayText = ""
+            LaunchedEffect(overlayText, isSeeking) {
+                if (!isSeeking) {
+                    delay(1200)
+                    overlayText = ""
+                }
             }
             Box(
                 modifier = Modifier
                     .align(Alignment.Center)
-                    .background(Color(0x99000000), RoundedCornerShape(10.dp))
-                    .padding(horizontal = 18.dp, vertical = 10.dp)
+                    .background(Color(0xAA000000), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 20.dp, vertical = 10.dp)
             ) {
-                Text(overlayText, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(overlayText, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
         }
 
-        if (isLocked && !isPipMode) {
-            IconButton(
-                onClick = { isLocked = false; showControls = true },
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .safeDrawingPadding()
-                    .padding(12.dp)
-                    .background(Color(0x88000000), CircleShape)
+        // আনলক বাটন: ট্যাপ করলে টাচ ও ওরিয়েন্টেশন দুটোই আনলক হবে
+        AnimatedVisibility(
+            visible = isLocked && showUnlockButton && !isPipMode,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .safeDrawingPadding()
+                .padding(bottom = 24.dp)
+        ) {
+            Surface(
+                onClick = {
+                    val act = context as ComponentActivity
+                    act.requestedOrientation = orientationBeforeLock
+                    isLocked = false
+                    showUnlockButton = false
+                    showControls = true
+                    overlayText = "Unlocked"
+                },
+                shape = RoundedCornerShape(24.dp),
+                color = Color(0xBB141414)
             ) {
-                Icon(Icons.Rounded.Lock, contentDescription = "Unlock", tint = Color(0xFFFF8800))
+                Row(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Rounded.Lock, contentDescription = "Unlock", tint = Color(0xFFFF8800), modifier = Modifier.size(20.dp))
+                    Text("TAP TO UNLOCK", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
             }
         }
 
@@ -487,14 +617,12 @@ fun VlcStylePlayerScreen(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0x77141414))
-                        .padding(horizontal = 4.dp, vertical = 1.dp),
+                        .background(Brush.verticalGradient(listOf(Color(0xAA000000), Color.Transparent)))
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = onBack, modifier = Modifier.size(34.dp)) {
-                        Icon(Icons.Rounded.ArrowBack, contentDescription = "Back", tint = Color.White, modifier = Modifier.size(18.dp))
+                        Icon(Icons.Rounded.ArrowBack, contentDescription = "Back", tint = Color.White, modifier = Modifier.size(20.dp))
                     }
                     Text(
                         text = videoTitle,
@@ -510,37 +638,37 @@ fun VlcStylePlayerScreen(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(Color(0x88141414))
-                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                        .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000))))
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(formatMillis(currentTime), color = Color.White, fontSize = 10.sp)
-                        Text(formatMillis(totalDuration), color = Color.White, fontSize = 10.sp)
+                        Text(formatMillis(currentTime), color = Color.White, fontSize = 11.sp)
+                        Text(formatMillis(totalDuration), color = Color.White, fontSize = 11.sp)
                     }
 
-                    Slider(
-                        value = (currentTime.toFloat() / totalDuration.toFloat()).coerceIn(0f, 1f),
-                        onValueChange = {
-                            val target = (it * totalDuration).toLong()
+                    SlimVideoSeekBar(
+                        currentTime = currentTime,
+                        totalDuration = totalDuration,
+                        onSeekPreview = { preview ->
+                            currentTime = preview
+                            overlayText = formatMillis(preview)
+                        },
+                        onSeekCommit = { target ->
                             currentTime = target
                             mediaPlayer.setTime(target)
+                            overlayText = ""
                         },
-                        modifier = Modifier.height(20.dp),
-                        colors = SliderDefaults.colors(
-                            thumbColor = Color(0xFFFF8800),
-                            activeTrackColor = Color(0xFFFF8800)
-                        )
+                        onDragStateChanged = { dragging ->
+                            isSeeking = dragging
+                            if (!dragging) overlayText = ""
+                        }
                     )
 
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp),
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -614,7 +742,7 @@ fun VlcStylePlayerScreen(
                                 act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                                 overlayText = "Portrait"
                             } else {
-                                act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                                act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                                 overlayText = "Landscape"
                             }
                         }, modifier = Modifier.size(36.dp)) {
@@ -628,7 +756,6 @@ fun VlcStylePlayerScreen(
             }
         }
 
-        // পরিচ্ছন্ন সাইড মেনু (Load .srt subtitle বাদ দেওয়া হয়েছে)
         AnimatedVisibility(
             visible = showSideMenu && !isLocked && !isPipMode,
             enter = slideInHorizontally(initialOffsetX = { it }),
@@ -648,7 +775,17 @@ fun VlcStylePlayerScreen(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                SideMenuItem(Icons.Rounded.LockOpen, "Lock") { isLocked = true; showSideMenu = false }
+                // Lock চাপলে বর্তমান ওরিয়েন্টেশন + টাচ দুটোই লক হয়ে যাবে
+                SideMenuItem(Icons.Rounded.LockOpen, "Lock") {
+                    val act = context as ComponentActivity
+                    orientationBeforeLock = act.requestedOrientation
+                    act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LOCKED
+                    isLocked = true
+                    showUnlockButton = true
+                    showSideMenu = false
+                    showControls = false
+                    overlayText = "Locked"
+                }
                 SideMenuItem(Icons.Rounded.Bedtime, "Sleep timer") { showSleepDialog = true; showSideMenu = false }
 
                 Row(
