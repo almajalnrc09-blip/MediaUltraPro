@@ -4,22 +4,14 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.PictureInPictureParams
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.media.AudioManager
-import android.media.MediaMetadataRetriever
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.CountDownTimer
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
@@ -40,10 +32,8 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -60,9 +50,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
@@ -78,10 +65,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
-import kotlin.math.abs
 
 class YouTubeJsBridge(private val onPlayingChanged: (Boolean) -> Unit) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -288,137 +272,22 @@ fun MainAppContainer(
     }
 
     if (fullscreenView != null) {
-        var ytLocked by remember { mutableStateOf(false) }
-        var gestureHud by remember { mutableStateOf("") }
-        var showFsBar by remember { mutableStateOf(true) }
-        val audioManager = remember { activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
-
-        LaunchedEffect(showFsBar) {
-            if (showFsBar) {
-                delay(3500)
-                showFsBar = false
-            }
-        }
-
-        BackHandler {
-            if (!ytLocked) onHideFullscreen()
-            else Toast.makeText(activity, "স্ক্রিন আনলক করুন", Toast.LENGTH_SHORT).show()
-        }
-
-        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    FrameLayout(ctx).apply {
-                        (fullscreenView.parent as? ViewGroup)?.removeView(fullscreenView)
-                        addView(
-                            fullscreenView,
-                            FrameLayout.LayoutParams(
-                                FrameLayout.LayoutParams.MATCH_PARENT,
-                                FrameLayout.LayoutParams.MATCH_PARENT
-                            )
+        BackHandler { onHideFullscreen() }
+        AndroidView(
+            modifier = Modifier.fillMaxSize().background(Color.Black),
+            factory = { ctx ->
+                FrameLayout(ctx).apply {
+                    (fullscreenView.parent as? ViewGroup)?.removeView(fullscreenView)
+                    addView(
+                        fullscreenView,
+                        FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT,
+                            FrameLayout.LayoutParams.MATCH_PARENT
                         )
-                    }
-                }
-            )
-
-            if (ytLocked) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(Unit) {
-                            detectDragGestures { _, _ -> }
-                        }
-                ) {
-                    IconButton(
-                        onClick = { ytLocked = false; showFsBar = true },
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .safeDrawingPadding()
-                            .padding(14.dp)
-                            .background(Color(0x99000000), CircleShape)
-                    ) {
-                        Icon(Icons.Rounded.Lock, contentDescription = "Unlock", tint = Color(0xFFFFC107))
-                    }
-                }
-            } else {
-                Row(modifier = Modifier.fillMaxSize()) {
-                    Box(
-                        modifier = Modifier
-                            .weight(0.22f)
-                            .fillMaxHeight()
-                            .pointerInput(Unit) {
-                                detectDragGestures { change, dragAmount ->
-                                    if (abs(dragAmount.y) > abs(dragAmount.x)) {
-                                        change.consume()
-                                        val lp = activity.window.attributes
-                                        val cur = if (lp.screenBrightness < 0) 0.5f else lp.screenBrightness
-                                        val next = (cur + (-dragAmount.y / size.height)).coerceIn(0.05f, 1.0f)
-                                        lp.screenBrightness = next
-                                        activity.window.attributes = lp
-                                        gestureHud = "Brightness: ${(next * 100).toInt()}%"
-                                    }
-                                }
-                            }
-                    )
-                    Spacer(modifier = Modifier.weight(0.56f))
-                    Box(
-                        modifier = Modifier
-                            .weight(0.22f)
-                            .fillMaxHeight()
-                            .pointerInput(Unit) {
-                                detectDragGestures { change, dragAmount ->
-                                    if (abs(dragAmount.y) > abs(dragAmount.x)) {
-                                        change.consume()
-                                        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                                        val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                                        val step = if (dragAmount.y < 0) 1 else -1
-                                        val nextVol = (curVol + step).coerceIn(0, maxVol)
-                                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, nextVol, 0)
-                                        gestureHud = "Volume: ${(nextVol * 100) / maxVol}%"
-                                    }
-                                }
-                            }
                     )
                 }
-
-                Row(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .safeDrawingPadding()
-                        .padding(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    IconButton(
-                        onClick = { ytLocked = true },
-                        modifier = Modifier.size(38.dp).background(Color(0x88000000), CircleShape)
-                    ) {
-                        Icon(Icons.Rounded.LockOpen, contentDescription = "Lock Screen", tint = Color.White, modifier = Modifier.size(20.dp))
-                    }
-                    IconButton(
-                        onClick = { onHideFullscreen() },
-                        modifier = Modifier.size(38.dp).background(Color(0x88000000), CircleShape)
-                    ) {
-                        Icon(Icons.Rounded.FullscreenExit, contentDescription = "Exit Fullscreen", tint = Color.White, modifier = Modifier.size(22.dp))
-                    }
-                }
             }
-
-            if (gestureHud.isNotEmpty()) {
-                LaunchedEffect(gestureHud) {
-                    delay(1000)
-                    gestureHud = ""
-                }
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .background(Color(0xAA000000), RoundedCornerShape(10.dp))
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                ) {
-                    Text(gestureHud, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                }
-            }
-        }
+        )
         return
     }
 
@@ -502,6 +371,7 @@ fun MainAppContainer(
         }
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize()) {
+            // YouTube ওয়েবভিউ স্বাভাবিক পূর্ণ হাইটে চলবে যাতে ভিডিও স্ক্রিন ছোট না হয়
             Box(
                 modifier = if (selectedTab == 0) {
                     Modifier
@@ -571,9 +441,6 @@ fun YouTubeTabScreen(
     onShowFullscreen: (View, WebChromeClient.CustomViewCallback) -> Unit,
     onHideFullscreen: () -> Unit
 ) {
-    val context = LocalContext.current
-    var currentUrl by remember { mutableStateOf("https://m.youtube.com") }
-
     val bgScript = """
         (function() {
             try {
@@ -606,123 +473,64 @@ fun YouTubeTabScreen(
         })();
     """.trimIndent()
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            update = { webView ->
-                webView.visibility = if (isVisible) View.VISIBLE else View.GONE
-            },
-            factory = { ctx ->
-                val webView = BackgroundWebView(ctx)
-                activity.activeWebView = webView
-                webView.addJavascriptInterface(
-                    YouTubeJsBridge { playing -> activity.isYouTubePlaying = playing },
-                    "UltraBridge"
-                )
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        update = { webView ->
+            webView.visibility = if (isVisible) View.VISIBLE else View.GONE
+        },
+        factory = { ctx ->
+            val webView = BackgroundWebView(ctx)
+            activity.activeWebView = webView
+            webView.addJavascriptInterface(
+                YouTubeJsBridge { playing -> activity.isYouTubePlaying = playing },
+                "UltraBridge"
+            )
 
-                val cookieManager = CookieManager.getInstance()
-                cookieManager.setAcceptCookie(true)
-                cookieManager.setAcceptThirdPartyCookies(webView, true)
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieManager.setAcceptThirdPartyCookies(webView, true)
 
-                webView.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    mediaPlaybackRequiresUserGesture = false
-                    cacheMode = WebSettings.LOAD_DEFAULT
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
+            webView.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                mediaPlaybackRequiresUserGesture = false
+                cacheMode = WebSettings.LOAD_DEFAULT
+                useWideViewPort = true
+                loadWithOverviewMode = true
+            }
+
+            webView.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val url = request?.url?.toString() ?: return false
+                    if (!url.startsWith("http://") && !url.startsWith("https://")) return true
+                    return false
                 }
 
-                webView.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                        val url = request?.url?.toString() ?: return false
-                        if (!url.startsWith("http://") && !url.startsWith("https://")) return true
-                        return false
-                    }
-
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        super.onPageFinished(view, url)
-                        if (url != null) currentUrl = url
-                        view?.evaluateJavascript(bgScript, null)
-                    }
-
-                    override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
-                        super.doUpdateVisitedHistory(view, url, isReload)
-                        if (url != null) currentUrl = url
-                        view?.evaluateJavascript(bgScript, null)
-                    }
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    view?.evaluateJavascript(bgScript, null)
                 }
 
-                webView.webChromeClient = object : WebChromeClient() {
-                    override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
-                        if (view != null && callback != null) onShowFullscreen(view, callback)
-                    }
+                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                    super.doUpdateVisitedHistory(view, url, isReload)
+                    view?.evaluateJavascript(bgScript, null)
+                }
+            }
 
-                    override fun onHideCustomView() {
-                        onHideFullscreen()
-                    }
+            webView.webChromeClient = object : WebChromeClient() {
+                override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                    if (view != null && callback != null) onShowFullscreen(view, callback)
                 }
 
-                webView.loadUrl("https://m.youtube.com")
-                webView
+                override fun onHideCustomView() {
+                    onHideFullscreen()
+                }
             }
-        )
 
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 12.dp, bottom = 12.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(Color(0xCC1E1E1E))
-                .padding(horizontal = 6.dp, vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(
-                onClick = {
-                    val linkToCopy = activity.activeWebView?.url ?: currentUrl
-                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("YouTube Link", linkToCopy))
-                    Toast.makeText(context, "লিংক কপি হয়েছে", Toast.LENGTH_SHORT).show()
-                },
-                modifier = Modifier.size(34.dp)
-            ) {
-                Icon(Icons.Rounded.ContentCopy, contentDescription = "Copy Link", tint = Color.White, modifier = Modifier.size(18.dp))
-            }
-            IconButton(
-                onClick = {
-                    val linkToShare = activity.activeWebView?.url ?: currentUrl
-                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, linkToShare)
-                    }
-                    context.startActivity(Intent.createChooser(shareIntent, "Share Link"))
-                },
-                modifier = Modifier.size(34.dp)
-            ) {
-                Icon(Icons.Rounded.Share, contentDescription = "Share Link", tint = Color(0xFFFFC107), modifier = Modifier.size(18.dp))
-            }
+            webView.loadUrl("https://m.youtube.com")
+            webView
         }
-    }
-}
-
-@Composable
-fun rememberEmbeddedAlbumArt(context: Context, uri: Uri): Bitmap? {
-    var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
-    LaunchedEffect(uri) {
-        bitmap = withContext(Dispatchers.IO) {
-            val retriever = MediaMetadataRetriever()
-            try {
-                retriever.setDataSource(context, uri)
-                val bytes = retriever.embeddedPicture
-                if (bytes != null) BitmapFactory.decodeByteArray(bytes, 0, bytes.size) else null
-            } catch (_: Exception) {
-                null
-            } finally {
-                try { retriever.release() } catch (_: Exception) { }
-            }
-        }
-    }
-    return bitmap
+    )
 }
 
 @Composable
@@ -893,8 +701,6 @@ fun MuzioMusicTabScreen(
     var showFullPlayer by remember { mutableStateOf(false) }
     var showEqualizer by remember { mutableStateOf(false) }
     var showQueueDialog by remember { mutableStateOf(false) }
-    var showSleepDialog by remember { mutableStateOf(false) }
-    var musicSleepTimer by remember { mutableStateOf<CountDownTimer?>(null) }
 
     var deleteTarget by remember { mutableStateOf<MediaFile?>(null) }
     var renameTarget by remember { mutableStateOf<MediaFile?>(null) }
@@ -902,12 +708,7 @@ fun MuzioMusicTabScreen(
     var pendingRenameAfterPerm by remember { mutableStateOf<Pair<MediaFile, String>?>(null) }
 
     LaunchedEffect(showFullPlayer) { onFullPlayerChanged(showFullPlayer) }
-    DisposableEffect(Unit) {
-        onDispose {
-            onFullPlayerChanged(false)
-            musicSleepTimer?.cancel()
-        }
-    }
+    DisposableEffect(Unit) { onDispose { onFullPlayerChanged(false) } }
 
     val deleteLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
@@ -967,22 +768,6 @@ fun MuzioMusicTabScreen(
         mediaController?.stop()
         onSongChanged(null)
         showFullPlayer = false
-    }
-
-    fun setMusicSleepTimer(minutes: Int) {
-        musicSleepTimer?.cancel()
-        if (minutes == 0) {
-            Toast.makeText(context, "Music Sleep Timer বন্ধ করা হয়েছে", Toast.LENGTH_SHORT).show()
-        } else {
-            musicSleepTimer = object : CountDownTimer(minutes * 60 * 1000L, 1000) {
-                override fun onTick(millisUntilFinished: Long) {}
-                override fun onFinish() {
-                    mediaController?.pause()
-                    Toast.makeText(context, "Sleep Timer শেষ—মিউজিক পজ করা হয়েছে", Toast.LENGTH_SHORT).show()
-                }
-            }.start()
-            Toast.makeText(context, "$minutes মিনিট পর মিউজিক পজ হবে", Toast.LENGTH_SHORT).show()
-        }
     }
 
     fun toggleFavorite(songId: Long) {
@@ -1073,7 +858,6 @@ fun MuzioMusicTabScreen(
                 ) {
                     itemsIndexed(displayedSongs, key = { _, item -> item.id }) { index, song ->
                         var menuExpanded by remember { mutableStateOf(false) }
-                        val coverArt = rememberEmbeddedAlbumArt(context, song.uri)
                         ListItem(
                             colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                             modifier = Modifier.clickable { playSong(song) },
@@ -1083,21 +867,12 @@ fun MuzioMusicTabScreen(
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Box(
                                         modifier = Modifier
-                                            .size(44.dp)
+                                            .size(42.dp)
                                             .clip(RoundedCornerShape(8.dp))
                                             .background(iconBoxColor),
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        if (coverArt != null) {
-                                            Image(
-                                                bitmap = coverArt.asImageBitmap(),
-                                                contentDescription = null,
-                                                contentScale = ContentScale.Crop,
-                                                modifier = Modifier.fillMaxSize()
-                                            )
-                                        } else {
-                                            Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = accentColor)
-                                        }
+                                        Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = accentColor)
                                     }
                                 }
                             },
@@ -1166,7 +941,6 @@ fun MuzioMusicTabScreen(
         }
 
         currentSong?.let { song ->
-            val miniArt = rememberEmbeddedAlbumArt(context, song.uri)
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -1176,24 +950,7 @@ fun MuzioMusicTabScreen(
                     .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(iconBoxColor),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (miniArt != null) {
-                        Image(
-                            bitmap = miniArt.asImageBitmap(),
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Icon(Icons.Rounded.Album, contentDescription = null, tint = accentColor, modifier = Modifier.size(24.dp))
-                    }
-                }
+                Icon(Icons.Rounded.Album, contentDescription = null, tint = accentColor, modifier = Modifier.size(32.dp))
                 Spacer(modifier = Modifier.width(8.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(song.title, color = titleColor, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = 13.sp)
@@ -1217,7 +974,6 @@ fun MuzioMusicTabScreen(
             BackHandler { showFullPlayer = false }
             val song = currentSong
             val isFav = favoriteIds.contains(song.id.toString())
-            val fullArt = rememberEmbeddedAlbumArt(context, song.uri)
 
             Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF7A6348)) {
                 Column(
@@ -1234,13 +990,8 @@ fun MuzioMusicTabScreen(
                             Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "Close", tint = Color.White)
                         }
                         Text("Now Playing", color = Color.White, fontWeight = FontWeight.Medium)
-                        Row {
-                            IconButton(onClick = { showSleepDialog = true }) {
-                                Icon(Icons.Rounded.Bedtime, contentDescription = "Sleep Timer", tint = Color.White)
-                            }
-                            IconButton(onClick = { showEqualizer = true }) {
-                                Icon(Icons.Rounded.Equalizer, contentDescription = "Equalizer", tint = Color(0xFFFFC107))
-                            }
+                        IconButton(onClick = { showEqualizer = true }) {
+                            Icon(Icons.Rounded.Equalizer, contentDescription = "Equalizer", tint = Color(0xFFFFC107))
                         }
                     }
 
@@ -1251,16 +1002,7 @@ fun MuzioMusicTabScreen(
                             .background(Color(0xFF4A3B2A)),
                         contentAlignment = Alignment.Center
                     ) {
-                        if (fullArt != null) {
-                            Image(
-                                bitmap = fullArt.asImageBitmap(),
-                                contentDescription = null,
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        } else {
-                            Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = Color(0xFFFFC107), modifier = Modifier.size(96.dp))
-                        }
+                        Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = Color(0xFFFFC107), modifier = Modifier.size(96.dp))
                     }
 
                     Row(
@@ -1364,24 +1106,6 @@ fun MuzioMusicTabScreen(
                     }
                 }
             }
-        }
-
-        if (showSleepDialog) {
-            AlertDialog(
-                onDismissRequest = { showSleepDialog = false },
-                title = { Text("Music Sleep Timer") },
-                text = {
-                    Column {
-                        listOf(0 to "Off", 15 to "15 Minutes", 30 to "30 Minutes", 45 to "45 Minutes", 60 to "60 Minutes").forEach { (mins, text) ->
-                            TextButton(
-                                onClick = { setMusicSleepTimer(mins); showSleepDialog = false },
-                                modifier = Modifier.fillMaxWidth()
-                            ) { Text(text) }
-                        }
-                    }
-                },
-                confirmButton = { TextButton(onClick = { showSleepDialog = false }) { Text("Cancel") } }
-            )
         }
 
         if (showQueueDialog) {
