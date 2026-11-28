@@ -5,24 +5,29 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
+import android.media.MediaMetadata
 import android.media.audiofx.BassBoost
 import android.media.audiofx.Equalizer
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.annotation.OptIn
-import androidx.core.app.NotificationCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSession as Media3Session
 import androidx.media3.session.MediaSessionService
 
 class MusicPlaybackService : MediaSessionService() {
-    private var mediaSession: MediaSession? = null
+    private var mediaSession: Media3Session? = null
 
     companion object {
         var equalizer: Equalizer? = null
@@ -68,10 +73,10 @@ class MusicPlaybackService : MediaSessionService() {
             }
         })
 
-        mediaSession = MediaSession.Builder(this, player).build()
+        mediaSession = Media3Session.Builder(this, player).build()
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+    override fun onGetSession(controllerInfo: Media3Session.ControllerInfo): Media3Session? = mediaSession
 
     override fun onDestroy() {
         equalizer?.release()
@@ -88,27 +93,149 @@ class MusicPlaybackService : MediaSessionService() {
     }
 }
 
-// YouTube ব্যাকগ্রাউন্ড ও লক-স্ক্রিন নোটিফিকেশন সার্ভিস (Play/Pause ও Stop বাটনসহ)
+// নেটিভ MediaSession + WakeLock + লক-স্ক্রিন কন্ট্রোলসহ YouTube ব্যাকগ্রাউন্ড সার্ভিস
 class YouTubeBackgroundService : Service() {
 
     companion object {
-        const val CHANNEL_ID = "yt_bg_playback_v2"
+        const val CHANNEL_ID = "yt_bg_media_v3"
         const val NOTIFICATION_ID = 202
+        const val ACTION_START_OR_UPDATE = "com.example.ultramediapro.YT_UPDATE"
         const val ACTION_YT_TOGGLE_PLAY = "com.example.ultramediapro.YT_TOGGLE_PLAY"
+        const val ACTION_YT_PLAY = "com.example.ultramediapro.YT_PLAY"
+        const val ACTION_YT_PAUSE = "com.example.ultramediapro.YT_PAUSE"
         const val ACTION_YT_STOP_BG = "com.example.ultramediapro.YT_STOP_BG"
+        const val EXTRA_IS_PLAYING = "IS_PLAYING"
+        const val EXTRA_TITLE = "VIDEO_TITLE"
+
+        @Volatile
+        var onCommand: ((String) -> Unit)? = null
+
+        @Volatile
+        var isRunning: Boolean = false
     }
+
+    private var mediaSession: MediaSession? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var currentTitle: String = "YouTube Background"
+    private var currentlyPlaying: Boolean = true
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val isPlaying = intent?.getBooleanExtra("IS_PLAYING", true) ?: true
+    override fun onCreate() {
+        super.onCreate()
+        isRunning = true
 
+        mediaSession = MediaSession(this, "MediaUltraProYouTube").apply {
+            setCallback(object : MediaSession.Callback() {
+                override fun onPlay() {
+                    currentlyPlaying = true
+                    acquireWakeLock()
+                    showMediaNotification()
+                    onCommand?.invoke(ACTION_YT_PLAY)
+                }
+
+                override fun onPause() {
+                    currentlyPlaying = false
+                    releaseWakeLock()
+                    showMediaNotification()
+                    onCommand?.invoke(ACTION_YT_PAUSE)
+                }
+
+                override fun onStop() {
+                    handleStopAndExit()
+                }
+            })
+            isActive = true
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action ?: ACTION_START_OR_UPDATE
+
+        when (action) {
+            ACTION_YT_TOGGLE_PLAY -> {
+                currentlyPlaying = !currentlyPlaying
+                if (currentlyPlaying) acquireWakeLock() else releaseWakeLock()
+                showMediaNotification()
+                onCommand?.invoke(if (currentlyPlaying) ACTION_YT_PLAY else ACTION_YT_PAUSE)
+                return START_NOT_STICKY
+            }
+            ACTION_YT_PLAY -> {
+                currentlyPlaying = true
+                acquireWakeLock()
+                showMediaNotification()
+                onCommand?.invoke(ACTION_YT_PLAY)
+                return START_NOT_STICKY
+            }
+            ACTION_YT_PAUSE -> {
+                currentlyPlaying = false
+                releaseWakeLock()
+                showMediaNotification()
+                onCommand?.invoke(ACTION_YT_PAUSE)
+                return START_NOT_STICKY
+            }
+            ACTION_YT_STOP_BG -> {
+                handleStopAndExit()
+                return START_NOT_STICKY
+            }
+            else -> {
+                currentlyPlaying = intent?.getBooleanExtra(EXTRA_IS_PLAYING, true) ?: true
+                val passedTitle = intent?.getStringExtra(EXTRA_TITLE)?.trim()
+                if (!passedTitle.isNullOrEmpty()) {
+                    currentTitle = passedTitle
+                }
+                if (currentlyPlaying) acquireWakeLock() else releaseWakeLock()
+                showMediaNotification()
+                return START_STICKY
+            }
+        }
+    }
+
+    private fun handleStopAndExit() {
+        currentlyPlaying = false
+        onCommand?.invoke(ACTION_YT_STOP_BG)
+        releaseWakeLock()
+        try {
+            mediaSession?.isActive = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (_: Exception) { }
+        stopSelf()
+    }
+
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MediaUltraPro::YouTubeAudioLock").apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(6 * 60 * 60 * 1000L)
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun showMediaNotification() {
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "YouTube Background Playback",
-                NotificationManager.IMPORTANCE_DEFAULT
+                "YouTube Background Player",
+                NotificationManager.IMPORTANCE_LOW
             ).apply {
                 setSound(null, null)
                 enableVibration(false)
@@ -116,6 +243,28 @@ class YouTubeBackgroundService : Service() {
             }
             manager.createNotificationChannel(channel)
         }
+
+        mediaSession?.setMetadata(
+            MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, currentTitle)
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, "MediaUltraPro • YouTube")
+                .build()
+        )
+        mediaSession?.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(
+                    PlaybackState.ACTION_PLAY or
+                        PlaybackState.ACTION_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_STOP
+                )
+                .setState(
+                    if (currentlyPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                    PlaybackState.PLAYBACK_POSITION_UNKNOWN,
+                    1f
+                )
+                .build()
+        )
 
         val openIntent = Intent(this, MainActivity::class.java).apply {
             this.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -127,37 +276,63 @@ class YouTubeBackgroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val toggleIntent = Intent(ACTION_YT_TOGGLE_PLAY).setPackage(packageName)
-        val togglePendingIntent = PendingIntent.getBroadcast(
+        val toggleIntent = Intent(this, YouTubeBackgroundService::class.java).apply {
+            action = ACTION_YT_TOGGLE_PLAY
+        }
+        val togglePendingIntent = PendingIntent.getService(
             this,
             1,
             toggleIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val stopIntent = Intent(ACTION_YT_STOP_BG).setPackage(packageName)
-        val stopPendingIntent = PendingIntent.getBroadcast(
+        val stopIntent = Intent(this, YouTubeBackgroundService::class.java).apply {
+            action = ACTION_YT_STOP_BG
+        }
+        val stopPendingIntent = PendingIntent.getService(
             this,
             2,
             stopIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val toggleIcon = if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
-        val toggleLabel = if (isPlaying) "Pause" else "Play"
-        val statusText = if (isPlaying) "YouTube ব্যাকগ্রাউন্ডে চলছে — খুলতে ট্যাপ করুন" else "YouTube পজ করা আছে — খুলতে ট্যাপ করুন"
+        val toggleIcon = if (currentlyPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val toggleLabel = if (currentlyPlaying) "Pause" else "Play"
+        val subtitle = if (currentlyPlaying) "ব্যাকগ্রাউন্ডে চলছে • খুলতে ট্যাপ করুন" else "পজ করা আছে • খুলতে ট্যাপ করুন"
 
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("MediaUltraPro • YouTube")
-            .setContentText(statusText)
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+
+        val toggleAction = Notification.Action.Builder(
+            Icon.createWithResource(this, toggleIcon),
+            toggleLabel,
+            togglePendingIntent
+        ).build()
+
+        val stopAction = Notification.Action.Builder(
+            Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+            "Stop",
+            stopPendingIntent
+        ).build()
+
+        val notification = builder
+            .setContentTitle(currentTitle)
+            .setContentText(subtitle)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(openPendingIntent)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setSilent(true)
-            .setOngoing(isPlaying)
-            .addAction(toggleIcon, toggleLabel, togglePendingIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setOngoing(currentlyPlaying)
+            .addAction(toggleAction)
+            .addAction(stopAction)
+            .setStyle(
+                Notification.MediaStyle()
+                    .setMediaSession(mediaSession?.sessionToken)
+                    .setShowActionsInCompactView(0, 1)
+            )
             .build()
 
         try {
@@ -167,11 +342,16 @@ class YouTubeBackgroundService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (_: Exception) { }
-
-        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        isRunning = false
+        releaseWakeLock()
+        try {
+            mediaSession?.isActive = false
+            mediaSession?.release()
+            mediaSession = null
+        } catch (_: Exception) { }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
