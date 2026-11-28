@@ -24,13 +24,19 @@ import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.CommandButton
 import androidx.media3.session.MediaSession as Media3Session
 import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 
 class MusicPlaybackService : MediaSessionService() {
     private var mediaSession: Media3Session? = null
 
     companion object {
+        const val ACTION_MUSIC_CLOSE = "com.example.ultramediapro.MUSIC_CLOSE"
         var equalizer: Equalizer? = null
         var bassBoost: BassBoost? = null
         private var activeSessionId: Int = C.AUDIO_SESSION_ID_UNSET
@@ -74,7 +80,76 @@ class MusicPlaybackService : MediaSessionService() {
             }
         })
 
-        mediaSession = Media3Session.Builder(this, player).build()
+        // নোটিফিকেশন মিডিয়া কার্ডের জন্য Close (×) কাস্টম বাটন
+        val closeCommand = SessionCommand(ACTION_MUSIC_CLOSE, Bundle.EMPTY)
+        val closeButton = CommandButton.Builder()
+            .setDisplayName("Close")
+            .setIconResId(android.R.drawable.ic_menu_close_clear_cancel)
+            .setSessionCommand(closeCommand)
+            .build()
+
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val sessionActivity = PendingIntent.getActivity(
+            this,
+            10,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val callback = object : Media3Session.Callback {
+            override fun onConnect(
+                session: Media3Session,
+                controller: Media3Session.ControllerInfo
+            ): Media3Session.ConnectionResult {
+                val sessionCommands = Media3Session.ConnectionResult.DEFAULT_SESSION_COMMANDS
+                    .buildUpon()
+                    .add(closeCommand)
+                    .build()
+                return Media3Session.ConnectionResult.accept(
+                    sessionCommands,
+                    Media3Session.ConnectionResult.DEFAULT_PLAYER_COMMANDS
+                )
+            }
+
+            override fun onPostConnect(
+                session: Media3Session,
+                controller: Media3Session.ControllerInfo
+            ) {
+                session.setCustomLayout(controller, listOf(closeButton))
+            }
+
+            override fun onCustomCommand(
+                session: Media3Session,
+                controller: Media3Session.ControllerInfo,
+                customCommand: SessionCommand,
+                args: Bundle
+            ): ListenableFuture<SessionResult> {
+                if (customCommand.customAction == ACTION_MUSIC_CLOSE) {
+                    session.player.pause()
+                    session.player.stop()
+                    session.player.clearMediaItems()
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            stopForeground(true)
+                        }
+                    } catch (_: Exception) { }
+                    stopSelf()
+                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+                }
+                return super.onCustomCommand(session, controller, customCommand, args)
+            }
+        }
+
+        mediaSession = Media3Session.Builder(this, player)
+            .setCallback(callback)
+            .setSessionActivity(sessionActivity)
+            .build()
+        mediaSession?.setCustomLayout(listOf(closeButton))
     }
 
     override fun onGetSession(controllerInfo: Media3Session.ControllerInfo): Media3Session? = mediaSession
@@ -285,7 +360,6 @@ class YouTubeBackgroundService : Service() {
         }
         mediaSession?.setMetadata(metaBuilder.build())
 
-        // Android 13/14/15 মিডিয়া কার্ডে সরাসরি ক্রস (×) ক্লোজ বাটন দেখানোর জন্য CustomAction
         val closeCustomAction = PlaybackState.CustomAction.Builder(
             ACTION_YT_STOP_BG,
             "Close",
