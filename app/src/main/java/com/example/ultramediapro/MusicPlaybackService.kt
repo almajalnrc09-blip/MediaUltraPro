@@ -15,6 +15,7 @@ import android.media.audiofx.Equalizer
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.annotation.OptIn
@@ -93,7 +94,7 @@ class MusicPlaybackService : MediaSessionService() {
     }
 }
 
-// নেটিভ MediaSession + WakeLock + লক-স্ক্রিন কন্ট্রোলসহ YouTube ব্যাকগ্রাউন্ড সার্ভিস
+// নেটিভ MediaSession + Custom Close (×) বাটন + WakeLock-সহ YouTube ব্যাকগ্রাউন্ড সার্ভিস
 class YouTubeBackgroundService : Service() {
 
     companion object {
@@ -106,9 +107,14 @@ class YouTubeBackgroundService : Service() {
         const val ACTION_YT_STOP_BG = "com.example.ultramediapro.YT_STOP_BG"
         const val EXTRA_IS_PLAYING = "IS_PLAYING"
         const val EXTRA_TITLE = "VIDEO_TITLE"
+        const val EXTRA_POSITION_MS = "POS_MS"
+        const val EXTRA_DURATION_MS = "DUR_MS"
 
         @Volatile
         var onCommand: ((String) -> Unit)? = null
+
+        @Volatile
+        var onSeekCommand: ((Long) -> Unit)? = null
 
         @Volatile
         var isRunning: Boolean = false
@@ -116,8 +122,10 @@ class YouTubeBackgroundService : Service() {
 
     private var mediaSession: MediaSession? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private var currentTitle: String = "YouTube Background"
+    private var currentTitle: String = "YouTube"
     private var currentlyPlaying: Boolean = true
+    private var currentPositionMs: Long = 0L
+    private var currentDurationMs: Long = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -143,6 +151,18 @@ class YouTubeBackgroundService : Service() {
 
                 override fun onStop() {
                     handleStopAndExit()
+                }
+
+                override fun onSeekTo(pos: Long) {
+                    currentPositionMs = pos.coerceAtLeast(0L)
+                    showMediaNotification()
+                    onSeekCommand?.invoke(currentPositionMs)
+                }
+
+                override fun onCustomAction(action: String, extras: Bundle?) {
+                    if (action == ACTION_YT_STOP_BG) {
+                        handleStopAndExit()
+                    }
                 }
             })
             isActive = true
@@ -184,6 +204,11 @@ class YouTubeBackgroundService : Service() {
                 if (!passedTitle.isNullOrEmpty()) {
                     currentTitle = passedTitle
                 }
+                val pos = intent?.getLongExtra(EXTRA_POSITION_MS, -1L) ?: -1L
+                val dur = intent?.getLongExtra(EXTRA_DURATION_MS, -1L) ?: -1L
+                if (pos >= 0L) currentPositionMs = pos
+                if (dur > 0L) currentDurationMs = dur
+
                 if (currentlyPlaying) acquireWakeLock() else releaseWakeLock()
                 showMediaNotification()
                 return START_STICKY
@@ -192,10 +217,16 @@ class YouTubeBackgroundService : Service() {
     }
 
     private fun handleStopAndExit() {
+        isRunning = false
         currentlyPlaying = false
         onCommand?.invoke(ACTION_YT_STOP_BG)
         releaseWakeLock()
         try {
+            mediaSession?.setPlaybackState(
+                PlaybackState.Builder()
+                    .setState(PlaybackState.STATE_STOPPED, 0L, 0f)
+                    .build()
+            )
             mediaSession?.isActive = false
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -203,6 +234,7 @@ class YouTubeBackgroundService : Service() {
                 @Suppress("DEPRECATION")
                 stopForeground(true)
             }
+            getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
         } catch (_: Exception) { }
         stopSelf()
     }
@@ -230,6 +262,7 @@ class YouTubeBackgroundService : Service() {
     }
 
     private fun showMediaNotification() {
+        if (!isRunning) return
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -244,24 +277,35 @@ class YouTubeBackgroundService : Service() {
             manager.createNotificationChannel(channel)
         }
 
-        mediaSession?.setMetadata(
-            MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, currentTitle)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, "MediaUltraPro • YouTube")
-                .build()
-        )
+        val metaBuilder = MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, currentTitle)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, "MediaUltraPro • YouTube")
+        if (currentDurationMs > 0L) {
+            metaBuilder.putLong(MediaMetadata.METADATA_KEY_DURATION, currentDurationMs)
+        }
+        mediaSession?.setMetadata(metaBuilder.build())
+
+        // Android 13/14/15 মিডিয়া কার্ডে সরাসরি ক্রস (×) ক্লোজ বাটন দেখানোর জন্য CustomAction
+        val closeCustomAction = PlaybackState.CustomAction.Builder(
+            ACTION_YT_STOP_BG,
+            "Close",
+            android.R.drawable.ic_menu_close_clear_cancel
+        ).build()
+
         mediaSession?.setPlaybackState(
             PlaybackState.Builder()
                 .setActions(
                     PlaybackState.ACTION_PLAY or
                         PlaybackState.ACTION_PAUSE or
                         PlaybackState.ACTION_PLAY_PAUSE or
-                        PlaybackState.ACTION_STOP
+                        PlaybackState.ACTION_STOP or
+                        PlaybackState.ACTION_SEEK_TO
                 )
+                .addCustomAction(closeCustomAction)
                 .setState(
                     if (currentlyPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
-                    PlaybackState.PLAYBACK_POSITION_UNKNOWN,
-                    1f
+                    currentPositionMs,
+                    if (currentlyPlaying) 1f else 0f
                 )
                 .build()
         )
@@ -315,7 +359,7 @@ class YouTubeBackgroundService : Service() {
 
         val stopAction = Notification.Action.Builder(
             Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
-            "Stop",
+            "Close",
             stopPendingIntent
         ).build()
 
