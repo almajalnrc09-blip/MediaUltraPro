@@ -10,9 +10,6 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -85,13 +82,15 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 
 class YouTubeJsBridge(
-    private val onStateChanged: (playing: Boolean, wantPlay: Boolean, title: String) -> Unit
+    private val onStateChanged: (playing: Boolean, wantPlay: Boolean, title: String, posMs: Long, durMs: Long) -> Unit
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @JavascriptInterface
-    fun reportState(playing: Boolean, wantPlay: Boolean, title: String) {
-        mainHandler.post { onStateChanged(playing, wantPlay, title) }
+    fun reportState(playing: Boolean, wantPlay: Boolean, title: String, posMs: Double, durMs: Double) {
+        mainHandler.post {
+            onStateChanged(playing, wantPlay, title, posMs.toLong().coerceAtLeast(0L), durMs.toLong().coerceAtLeast(0L))
+        }
     }
 }
 
@@ -104,12 +103,12 @@ class MainActivity : ComponentActivity() {
     @Volatile var isYouTubePlaying: Boolean = false
     @Volatile var userWantsYouTubePlay: Boolean = false
     @Volatile var currentYouTubeTitle: String = "YouTube"
+    @Volatile var currentYouTubePosMs: Long = 0L
+    @Volatile var currentYouTubeDurMs: Long = 0L
     var activeWebView: BackgroundWebView? = null
     var customFullscreenView by mutableStateOf<View?>(null)
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
-
-    private var audioFocusRequest: AudioFocusRequest? = null
-    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { }
+    private val bgHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -121,7 +120,6 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 when (command) {
                     YouTubeBackgroundService.ACTION_YT_PLAY -> {
-                        requestYouTubeAudioFocus()
                         activeWebView?.onResume()
                         activeWebView?.resumeTimers()
                         isYouTubePlaying = true
@@ -154,7 +152,6 @@ class MainActivity : ComponentActivity() {
                     YouTubeBackgroundService.ACTION_YT_STOP_BG -> {
                         isYouTubePlaying = false
                         userWantsYouTubePlay = false
-                        abandonYouTubeAudioFocus()
                         activeWebView?.evaluateJavascript(
                             """
                             (function() {
@@ -167,6 +164,16 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
+            }
+        }
+
+        YouTubeBackgroundService.onSeekCommand = { posMs ->
+            runOnUiThread {
+                val secs = posMs / 1000.0
+                activeWebView?.evaluateJavascript(
+                    "var v = document.querySelector('video'); if (v && isFinite(v.duration)) { v.currentTime = $secs; }",
+                    null
+                )
             }
         }
 
@@ -211,40 +218,6 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
-    }
-
-    private fun requestYouTubeAudioFocus() {
-        try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (audioFocusRequest == null) {
-                    val attrs = AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                    audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setAudioAttributes(attrs)
-                        .setOnAudioFocusChangeListener(audioFocusListener)
-                        .build()
-                }
-                audioFocusRequest?.let { am.requestAudioFocus(it) }
-            } else {
-                @Suppress("DEPRECATION")
-                am.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
-            }
-        } catch (_: Exception) { }
-    }
-
-    private fun abandonYouTubeAudioFocus() {
-        try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
-            } else {
-                @Suppress("DEPRECATION")
-                am.abandonAudioFocus(audioFocusListener)
-            }
-        } catch (_: Exception) { }
     }
 
     fun applySystemBarAppearance(isDarkTheme: Boolean) {
@@ -307,25 +280,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun onYouTubeStateUpdated(playing: Boolean, wantPlay: Boolean, title: String) {
+    fun onYouTubeStateUpdated(playing: Boolean, wantPlay: Boolean, title: String, posMs: Long, durMs: Long) {
         val cleanedTitle = title.replace(" - YouTube", "").trim().ifEmpty { "YouTube" }
         val stateChanged = isYouTubePlaying != playing || currentYouTubeTitle != cleanedTitle
         isYouTubePlaying = playing
         userWantsYouTubePlay = wantPlay
         currentYouTubeTitle = cleanedTitle
+        currentYouTubePosMs = posMs
+        currentYouTubeDurMs = durMs
         if (isAppInBackground && (stateChanged || (playing && !YouTubeBackgroundService.isRunning))) {
             if (playing || YouTubeBackgroundService.isRunning) {
-                startOrUpdateYouTubeNotification(playing, cleanedTitle)
+                startOrUpdateYouTubeNotification(playing, cleanedTitle, posMs, durMs)
             }
         }
     }
 
-    fun startOrUpdateYouTubeNotification(playing: Boolean, title: String = currentYouTubeTitle) {
+    fun startOrUpdateYouTubeNotification(
+        playing: Boolean,
+        title: String = currentYouTubeTitle,
+        posMs: Long = currentYouTubePosMs,
+        durMs: Long = currentYouTubeDurMs
+    ) {
         try {
             val intent = Intent(this, YouTubeBackgroundService::class.java).apply {
                 action = YouTubeBackgroundService.ACTION_START_OR_UPDATE
                 putExtra(YouTubeBackgroundService.EXTRA_IS_PLAYING, playing)
                 putExtra(YouTubeBackgroundService.EXTRA_TITLE, title)
+                putExtra(YouTubeBackgroundService.EXTRA_POSITION_MS, posMs)
+                putExtra(YouTubeBackgroundService.EXTRA_DURATION_MS, durMs)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent)
@@ -335,15 +317,37 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) { }
     }
 
+    // আলাদা AudioFocus না কেড়ে WebView-এর নিজস্ব প্লেব্যাক নিরবচ্ছিন্ন রাখা
     private fun keepYouTubeAliveInBackground() {
-        requestYouTubeAudioFocus()
         activeWebView?.onResume()
         activeWebView?.resumeTimers()
         activeWebView?.evaluateJavascript(
             "window.__ultraInBg = true; if (window.__ultraEnsurePlay) window.__ultraEnsurePlay();",
             null
         )
-        startOrUpdateYouTubeNotification(true, currentYouTubeTitle)
+        startOrUpdateYouTubeNotification(true, currentYouTubeTitle, currentYouTubePosMs, currentYouTubeDurMs)
+
+        // Activity pause/stop হওয়ার পর WebView যেন থ্রটল না হয় তার জন্য ফলো-আপ চেক
+        bgHandler.postDelayed({
+            if (isAppInBackground && userWantsYouTubePlay) {
+                activeWebView?.onResume()
+                activeWebView?.resumeTimers()
+                activeWebView?.evaluateJavascript(
+                    "var v = document.querySelector('video'); if (v && window.__ultraWantPlay && v.paused && !v.ended) { v.play().catch(function(){}); }",
+                    null
+                )
+            }
+        }, 180)
+        bgHandler.postDelayed({
+            if (isAppInBackground && userWantsYouTubePlay) {
+                activeWebView?.onResume()
+                activeWebView?.resumeTimers()
+                activeWebView?.evaluateJavascript(
+                    "var v = document.querySelector('video'); if (v && window.__ultraWantPlay && v.paused && !v.ended) { v.play().catch(function(){}); }",
+                    null
+                )
+            }
+        }, 500)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -356,6 +360,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         isAppInBackground = false
+        bgHandler.removeCallbacksAndMessages(null)
         stopService(Intent(this, YouTubeBackgroundService::class.java))
         activeWebView?.evaluateJavascript("window.__ultraInBg = false;", null)
         activeWebView?.onResume()
@@ -370,7 +375,6 @@ class MainActivity : ComponentActivity() {
             if (isYouTubePlaying || userWantsYouTubePlay || customFullscreenView != null) {
                 keepYouTubeAliveInBackground()
             } else {
-                // JS ব্রিজ আপডেটে দেরি হলে সরাসরি ভিডিও চেক করে ব্যাকগ্রাউন্ড সার্ভিস চালু করা
                 activeWebView?.evaluateJavascript(
                     "(function(){ var v=document.querySelector('video'); return !!(v && !v.paused && !v.ended); })();"
                 ) { res ->
@@ -393,8 +397,9 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        bgHandler.removeCallbacksAndMessages(null)
         YouTubeBackgroundService.onCommand = null
-        abandonYouTubeAudioFocus()
+        YouTubeBackgroundService.onSeekCommand = null
         stopService(Intent(this, YouTubeBackgroundService::class.java))
         super.onDestroy()
     }
@@ -516,7 +521,6 @@ fun MainAppContainer(
             }
         }
 
-        // স্লিম (36dp) কিন্তু দুই পাশে হালকা প্রসারিত (76% প্রস্থ) ফ্লোটিং পিল নেভিগেশন বার
         if (!isMusicFullPlayerOpen && fullscreenView == null) {
             Surface(
                 modifier = Modifier
@@ -646,7 +650,9 @@ private val AD_HOST_PATTERNS = listOf(
     "ads.youtube.com",
     "s0.2mdn.net",
     "google-analytics.com",
-    "googletagmanager.com"
+    "googletagmanager.com",
+    "pagead2.googlesyndication.com",
+    "tpc.googlesyndication.com"
 )
 
 private fun isAdNetworkUrl(url: String): Boolean {
@@ -656,8 +662,12 @@ private fun isAdNetworkUrl(url: String): Boolean {
         if (lower.contains("/api/stats/ads") ||
             lower.contains("/pagead/") ||
             lower.contains("/ptracking") ||
-            lower.contains("/get_midroll_info")
+            lower.contains("/get_midroll_info") ||
+            lower.contains("/youtubei/v1/log_event")
         ) return true
+    }
+    if (lower.contains("googlevideo.com") && (lower.contains("&oad=") || lower.contains("adformat="))) {
+        return true
     }
     return false
 }
@@ -670,6 +680,64 @@ fun YouTubeTabScreen(
     onShowFullscreen: (View, WebChromeClient.CustomViewCallback) -> Unit,
     onHideFullscreen: () -> Unit
 ) {
+    // লেয়ার ২: পেজ লোডের শুরুতেই player JSON থেকে শুরুর (pre-roll) ও মাঝের অ্যাড ছেঁকে ফেলা
+    val adPreScript = """
+        (function() {
+            if (window.__ultraFetchHooked) return;
+            window.__ultraFetchHooked = true;
+            function stripAds(obj) {
+                if (!obj || typeof obj !== 'object') return obj;
+                try {
+                    if (obj.adPlacements) obj.adPlacements = [];
+                    if (obj.playerAds) obj.playerAds = [];
+                    if (obj.adSlots) obj.adSlots = [];
+                    if (obj.adBreakHeartbeatParams) delete obj.adBreakHeartbeatParams;
+                } catch(e) {}
+                return obj;
+            }
+            try {
+                if (window.ytInitialPlayerResponse) stripAds(window.ytInitialPlayerResponse);
+                var _ytIPR = window.ytInitialPlayerResponse;
+                Object.defineProperty(window, 'ytInitialPlayerResponse', {
+                    configurable: true,
+                    get: function() { return _ytIPR; },
+                    set: function(val) { _ytIPR = stripAds(val); }
+                });
+            } catch(e) {}
+            try {
+                var origFetch = window.fetch;
+                window.fetch = function(input, init) {
+                    var url = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
+                    var p = origFetch.apply(this, arguments);
+                    if (url && (url.indexOf('/youtubei/v1/player') !== -1 || url.indexOf('/youtubei/v1/next') !== -1)) {
+                        return p.then(function(resp) {
+                            try {
+                                var cloned = resp.clone();
+                                return cloned.text().then(function(txt) {
+                                    try {
+                                        var data = JSON.parse(txt);
+                                        stripAds(data);
+                                        if (data && data.playerResponse) stripAds(data.playerResponse);
+                                        var headers = new Headers(resp.headers);
+                                        headers.delete('content-length');
+                                        headers.delete('content-encoding');
+                                        return new Response(JSON.stringify(data), {
+                                            status: resp.status,
+                                            statusText: resp.statusText,
+                                            headers: headers
+                                        });
+                                    } catch(e) { return resp; }
+                                }).catch(function() { return resp; });
+                            } catch(e) { return resp; }
+                        });
+                    }
+                    return p;
+                };
+            } catch(e) {}
+        })();
+    """.trimIndent()
+
+    // Trusted-Types নিরাপদ (textContent ব্যবহার করে) CSS + ব্যাকগ্রাউন্ড প্লে + অ্যাড-স্কিপার + ১৬:৯ বড় প্লেয়ার
     val bgScript = """
         (function() {
             try {
@@ -683,49 +751,65 @@ fun YouTubeTabScreen(
                     window.addEventListener(evt, stopEvt, true);
                     document.addEventListener(evt, stopEvt, true);
                 });
+            } catch(e) {}
 
-                // অ্যাড হাইড + স্বাভাবিক ১৬:৯ বড় ভিডিও প্লেয়ার সাইজ CSS
+            try {
                 var ultraCss = document.getElementById('ultra-main-css');
                 if (!ultraCss) {
                     ultraCss = document.createElement('style');
                     ultraCss.id = 'ultra-main-css';
-                    ultraCss.innerHTML =
+                    ultraCss.textContent =
                         'ytm-open-app-button, .open-app-button, a[aria-label="Open App"], button[aria-label="Open App"], ' +
                         'ytm-promoted-sparkles-web-renderer, ytm-promoted-video-renderer, ytm-companion-ad-renderer, ' +
                         'ytm-ad-slot-renderer, ad-slot-renderer, ytm-in-feed-ad-layout-renderer, ytm-statement-banner-renderer, ' +
                         'ytm-mealbar-promo-renderer, .ytp-ad-overlay-container, .ytp-ad-message-container, #player-ads { display: none !important; } ' +
-                        'body.ultra-watch-portrait .player-size { height: 56.25vw !important; min-height: 56.25vw !important; max-height: 56.25vw !important; padding-bottom: 0 !important; } ' +
-                        'body.ultra-watch-portrait #player-container-id, body.ultra-watch-portrait .player-container, ' +
-                        'body.ultra-watch-portrait #player, body.ultra-watch-portrait #movie_player, ' +
-                        'body.ultra-watch-portrait .html5-video-player, body.ultra-watch-portrait .html5-video-container { ' +
-                        'width: 100vw !important; max-width: 100vw !important; height: 56.25vw !important; min-height: 56.25vw !important; max-height: 56.25vw !important; } ' +
-                        'body.ultra-watch-portrait #movie_player video, body.ultra-watch-portrait video.html5-main-video { ' +
-                        'width: 100vw !important; height: 56.25vw !important; left: 0 !important; top: 0 !important; object-fit: contain !important; }';
-                    document.head.appendChild(ultraCss);
+                        'body.ultra-watch-portrait .player-size, ' +
+                        'body.ultra-watch-portrait #player-container-id, ' +
+                        'body.ultra-watch-portrait .player-container, ' +
+                        'body.ultra-watch-portrait #player, ' +
+                        'body.ultra-watch-portrait #movie_player, ' +
+                        'body.ultra-watch-portrait .html5-video-player, ' +
+                        'body.ultra-watch-portrait .html5-video-container { ' +
+                        'width: 100vw !important; max-width: 100vw !important; ' +
+                        'height: 56.25vw !important; min-height: 56.25vw !important; max-height: 56.25vw !important; ' +
+                        'padding-bottom: 0 !important; margin-left: 0 !important; margin-right: 0 !important; } ' +
+                        'body.ultra-watch-portrait #movie_player video, ' +
+                        'body.ultra-watch-portrait video.html5-main-video { ' +
+                        'width: 100vw !important; height: 56.25vw !important; ' +
+                        'max-width: 100vw !important; max-height: 56.25vw !important; ' +
+                        'left: 0 !important; top: 0 !important; object-fit: contain !important; }';
+                    (document.head || document.documentElement).appendChild(ultraCss);
                 }
+            } catch(e) {}
 
+            try {
                 if (!window.__ultraTrackerInstalled) {
                     window.__ultraTrackerInstalled = true;
                     window.__ultraWantPlay = false;
                     window.__ultraInBg = false;
                     window.__ultraLastTouch = 0;
                     window.__ultraAdMuted = false;
+                    window.__ultraWasWatchPortrait = false;
 
                     document.addEventListener('touchstart', function() { window.__ultraLastTouch = Date.now(); }, true);
                     document.addEventListener('click', function() { window.__ultraLastTouch = Date.now(); }, true);
 
                     window.__ultraReport = function() {
-                        var v = document.querySelector('video');
-                        var playing = !!(v && !v.paused && !v.ended && v.readyState > 1);
-                        var title = document.title || 'YouTube';
-                        if (window.UltraBridge) {
-                            window.UltraBridge.reportState(playing, !!window.__ultraWantPlay, title);
-                        }
+                        try {
+                            var v = document.querySelector('video');
+                            var playing = !!(v && !v.paused && !v.ended && v.readyState > 1);
+                            var posMs = (v && isFinite(v.currentTime)) ? Math.max(0, Math.floor(v.currentTime * 1000)) : 0;
+                            var durMs = (v && isFinite(v.duration)) ? Math.max(0, Math.floor(v.duration * 1000)) : 0;
+                            var titleEl = document.querySelector('h2.slim-video-information-title, .slim-video-information-title, ytm-slim-video-metadata-section-renderer h2');
+                            var title = (titleEl && titleEl.textContent) ? titleEl.textContent.trim() : (document.title || 'YouTube');
+                            if (window.UltraBridge) {
+                                window.UltraBridge.reportState(playing, !!window.__ultraWantPlay, title, posMs, durMs);
+                            }
+                        } catch(e) {}
                     };
 
                     window.__ultraEnsurePlay = function() {
-                        var tries = [50, 250, 600, 1100];
-                        tries.forEach(function(ms) {
+                        [40, 180, 450, 900].forEach(function(ms) {
                             setTimeout(function() {
                                 var v = document.querySelector('video');
                                 if (v && window.__ultraWantPlay && v.paused && !v.ended) {
@@ -752,7 +836,7 @@ fun YouTubeTabScreen(
                                     if (window.__ultraInBg && window.__ultraWantPlay && v.paused && !v.ended) {
                                         v.play().catch(function(){});
                                     }
-                                }, 150);
+                                }, 120);
                             }
                             window.__ultraReport();
                         });
@@ -762,54 +846,90 @@ fun YouTubeTabScreen(
                     }
 
                     function skipVideoAdsIfAny() {
-                        var player = document.querySelector('#movie_player, .html5-video-player');
-                        var isAd = !!(player && (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')));
-                        var v = document.querySelector('video');
-                        if (isAd && v) {
-                            if (!window.__ultraAdMuted) {
-                                window.__ultraAdMuted = true;
-                                v.muted = true;
+                        try {
+                            var player = document.querySelector('#movie_player, .html5-video-player');
+                            var isAd = !!(
+                                (player && (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting'))) ||
+                                document.querySelector('#player-container-id .ytp-ad-player-overlay, #player-container-id .ytp-ad-player-overlay-layout, #player-container-id .ytp-ad-skip-button, #player-container-id .ytp-ad-skip-button-modern, #player-container-id .ytp-skip-ad-button, #player-container-id .ytp-ad-preview-container')
+                            );
+                            var v = document.querySelector('video');
+                            if (isAd && v) {
+                                if (!window.__ultraAdMuted) {
+                                    window.__ultraAdMuted = true;
+                                    v.muted = true;
+                                }
+                                try { v.playbackRate = 16; } catch(e) {}
+                                if (isFinite(v.duration) && v.duration > 0.3 && v.currentTime < v.duration - 0.1) {
+                                    v.currentTime = v.duration - 0.05;
+                                }
+                                document.querySelectorAll('#player-container-id .ytp-ad-skip-button, #player-container-id .ytp-ad-skip-button-modern, #player-container-id .ytp-skip-ad-button, #player-container-id [id^="skip-button"], #player-container-id button').forEach(function(btn) {
+                                    var t = (btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '').trim().toLowerCase();
+                                    if (t === 'skip' || t === 'skip ad' || t === 'skip ads') {
+                                        btn.click();
+                                    }
+                                });
+                            } else if (!isAd && window.__ultraAdMuted && v) {
+                                window.__ultraAdMuted = false;
+                                v.muted = false;
+                                try { v.playbackRate = 1; } catch(e) {}
                             }
-                            if (isFinite(v.duration) && v.duration > 0.5 && v.currentTime < v.duration - 0.2) {
-                                v.currentTime = v.duration - 0.1;
-                            }
-                            document.querySelectorAll('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, [id^="skip-button"]').forEach(function(btn) {
-                                btn.click();
-                            });
-                        } else if (!isAd && window.__ultraAdMuted && v) {
-                            window.__ultraAdMuted = false;
-                            v.muted = false;
-                        }
+                        } catch(e) {}
                     }
 
                     function updateWatchSizeClass() {
-                        var isWatch = location.pathname.indexOf('/watch') === 0;
-                        var isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-                        var isPortrait = window.innerHeight > window.innerWidth;
-                        if (document.body) {
-                            if (isWatch && !isFs && isPortrait) {
-                                document.body.classList.add('ultra-watch-portrait');
-                            } else {
-                                document.body.classList.remove('ultra-watch-portrait');
+                        try {
+                            var isWatch = location.pathname.indexOf('/watch') === 0;
+                            var isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+                            var isPortrait = window.innerHeight > window.innerWidth;
+                            var shouldApply = isWatch && !isFs && isPortrait;
+                            if (document.body) {
+                                if (shouldApply) {
+                                    document.body.classList.add('ultra-watch-portrait');
+                                    var v = document.querySelector('#movie_player video, video.html5-main-video');
+                                    if (v) {
+                                        var w = window.innerWidth;
+                                        var h = Math.round(w * 9 / 16);
+                                        v.style.width = w + 'px';
+                                        v.style.height = h + 'px';
+                                        v.style.left = '0px';
+                                        v.style.top = '0px';
+                                    }
+                                } else {
+                                    document.body.classList.remove('ultra-watch-portrait');
+                                }
+                                if (shouldApply !== window.__ultraWasWatchPortrait) {
+                                    window.__ultraWasWatchPortrait = shouldApply;
+                                    window.dispatchEvent(new Event('resize'));
+                                }
                             }
-                        }
+                        } catch(e) {}
                     }
 
+                    function hideOpenAppButtons() {
+                        try {
+                            document.querySelectorAll('a, button, ytm-button-renderer, yt-button-shape, c3-material-button').forEach(function(el) {
+                                var raw = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                                var href = (el.getAttribute('href') || '').toLowerCase();
+                                if (raw === 'open app' || href.indexOf('redirect_app_store') !== -1 || href.indexOf('intent://') === 0) {
+                                    var wrap = el.closest('ytm-button-renderer, c3-material-button, yt-button-shape') || el;
+                                    wrap.style.setProperty('display', 'none', 'important');
+                                }
+                            });
+                        } catch(e) {}
+                    }
+
+                    // দ্রুত অ্যাড-স্কিপার ও প্লেয়ার সাইজ লুপ
                     setInterval(function() {
-                        document.querySelectorAll('a, button, ytm-button-renderer, yt-button-shape, c3-material-button').forEach(function(el) {
-                            var raw = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                            var href = (el.getAttribute('href') || '').toLowerCase();
-                            if (raw === 'open app' || href.indexOf('redirect_app_store') !== -1 || href.indexOf('intent://') === 0) {
-                                var wrap = el.closest('ytm-button-renderer, c3-material-button, yt-button-shape') || el;
-                                wrap.style.setProperty('display', 'none', 'important');
-                            }
-                        });
-                        updateWatchSizeClass();
                         skipVideoAdsIfAny();
+                        updateWatchSizeClass();
                         var v = document.querySelector('video');
                         hookVideo(v);
+                    }, 150);
+
+                    setInterval(function() {
+                        hideOpenAppButtons();
                         window.__ultraReport();
-                    }, 350);
+                    }, 500);
                 }
             } catch(e) {}
         })();
@@ -824,8 +944,8 @@ fun YouTubeTabScreen(
             val webView = BackgroundWebView(ctx)
             activity.activeWebView = webView
             webView.addJavascriptInterface(
-                YouTubeJsBridge { playing, wantPlay, title ->
-                    activity.onYouTubeStateUpdated(playing, wantPlay, title)
+                YouTubeJsBridge { playing, wantPlay, title, posMs, durMs ->
+                    activity.onYouTubeStateUpdated(playing, wantPlay, title, posMs, durMs)
                 },
                 "UltraBridge"
             )
@@ -862,13 +982,20 @@ fun YouTubeTabScreen(
                     return false
                 }
 
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    view?.evaluateJavascript(adPreScript, null)
+                }
+
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
+                    view?.evaluateJavascript(adPreScript, null)
                     view?.evaluateJavascript(bgScript, null)
                 }
 
                 override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                     super.doUpdateVisitedHistory(view, url, isReload)
+                    view?.evaluateJavascript(adPreScript, null)
                     view?.evaluateJavascript(bgScript, null)
                 }
             }
