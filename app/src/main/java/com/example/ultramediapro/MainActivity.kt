@@ -73,6 +73,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata as Media3Metadata
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -115,7 +116,6 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
-        // নোটিফিকেশন ও লক-স্ক্রিন মিডিয়া বাটনের সরাসরি কমান্ড হ্যান্ডলার
         YouTubeBackgroundService.onCommand = { command ->
             runOnUiThread {
                 when (command) {
@@ -317,7 +317,6 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) { }
     }
 
-    // আলাদা AudioFocus না কেড়ে WebView-এর নিজস্ব প্লেব্যাক নিরবচ্ছিন্ন রাখা
     private fun keepYouTubeAliveInBackground() {
         activeWebView?.onResume()
         activeWebView?.resumeTimers()
@@ -327,7 +326,6 @@ class MainActivity : ComponentActivity() {
         )
         startOrUpdateYouTubeNotification(true, currentYouTubeTitle, currentYouTubePosMs, currentYouTubeDurMs)
 
-        // Activity pause/stop হওয়ার পর WebView যেন থ্রটল না হয় তার জন্য ফলো-আপ চেক
         bgHandler.postDelayed({
             if (isAppInBackground && userWantsYouTubePlay) {
                 activeWebView?.onResume()
@@ -560,7 +558,6 @@ fun MainAppContainer(
             }
         }
 
-        // YouTube ফুলস্ক্রিন ওভারলে
         if (fullscreenView != null) {
             var ytLocked by remember { mutableStateOf(false) }
 
@@ -642,6 +639,7 @@ class BackgroundWebView(context: Context) : WebView(context) {
     }
 }
 
+// শুধুমাত্র অ্যাড ট্র্যাকিং ও ব্যানার ডোমেইন ব্লক (googlevideo.com ব্লক না করায় ব্ল্যাক স্ক্রিন ওয়েটিং হবে না)
 private val AD_HOST_PATTERNS = listOf(
     "doubleclick.net",
     "googlesyndication.com",
@@ -662,12 +660,8 @@ private fun isAdNetworkUrl(url: String): Boolean {
         if (lower.contains("/api/stats/ads") ||
             lower.contains("/pagead/") ||
             lower.contains("/ptracking") ||
-            lower.contains("/get_midroll_info") ||
-            lower.contains("/youtubei/v1/log_event")
+            lower.contains("/get_midroll_info")
         ) return true
-    }
-    if (lower.contains("googlevideo.com") && (lower.contains("&oad=") || lower.contains("adformat="))) {
-        return true
     }
     return false
 }
@@ -680,44 +674,79 @@ fun YouTubeTabScreen(
     onShowFullscreen: (View, WebChromeClient.CustomViewCallback) -> Unit,
     onHideFullscreen: () -> Unit
 ) {
-    // লেয়ার ২: পেজ লোডের শুরুতেই player JSON থেকে শুরুর (pre-roll) ও মাঝের অ্যাড ছেঁকে ফেলা
+    // ডিপ JSON অ্যাড-ফিল্টার (JSON.parse + Response.prototype.json + fetch + ytInitialPlayerResponse)
     val adPreScript = """
         (function() {
             if (window.__ultraFetchHooked) return;
             window.__ultraFetchHooked = true;
-            function stripAds(obj) {
-                if (!obj || typeof obj !== 'object') return obj;
+
+            function stripAds(obj, depth) {
+                if (!obj || typeof obj !== 'object' || depth > 5) return obj;
                 try {
-                    if (obj.adPlacements) obj.adPlacements = [];
-                    if (obj.playerAds) obj.playerAds = [];
-                    if (obj.adSlots) obj.adSlots = [];
-                    if (obj.adBreakHeartbeatParams) delete obj.adBreakHeartbeatParams;
+                    if (Array.isArray(obj)) {
+                        for (var i = 0; i < obj.length; i++) {
+                            stripAds(obj[i], depth + 1);
+                        }
+                        return obj;
+                    }
+                    if ('adPlacements' in obj) obj.adPlacements = [];
+                    if ('playerAds' in obj) obj.playerAds = [];
+                    if ('adSlots' in obj) obj.adSlots = [];
+                    if ('adBreakHeartbeatParams' in obj) delete obj.adBreakHeartbeatParams;
+                    if ('adBreakParams' in obj) delete obj.adBreakParams;
+                    if (obj.playerResponse && typeof obj.playerResponse === 'object') {
+                        stripAds(obj.playerResponse, depth + 1);
+                    }
+                    if (obj.response && typeof obj.response === 'object') {
+                        stripAds(obj.response, depth + 1);
+                    }
+                    if (obj.page && typeof obj.page === 'object') {
+                        stripAds(obj.page, depth + 1);
+                    }
                 } catch(e) {}
                 return obj;
             }
+
             try {
-                if (window.ytInitialPlayerResponse) stripAds(window.ytInitialPlayerResponse);
+                if (window.ytInitialPlayerResponse) stripAds(window.ytInitialPlayerResponse, 0);
                 var _ytIPR = window.ytInitialPlayerResponse;
                 Object.defineProperty(window, 'ytInitialPlayerResponse', {
                     configurable: true,
                     get: function() { return _ytIPR; },
-                    set: function(val) { _ytIPR = stripAds(val); }
+                    set: function(val) { _ytIPR = stripAds(val, 0); }
                 });
             } catch(e) {}
+
+            try {
+                var origParse = JSON.parse;
+                JSON.parse = function() {
+                    var res = origParse.apply(this, arguments);
+                    return stripAds(res, 0);
+                };
+            } catch(e) {}
+
+            try {
+                var origJson = Response.prototype.json;
+                Response.prototype.json = function() {
+                    return origJson.apply(this, arguments).then(function(data) {
+                        return stripAds(data, 0);
+                    });
+                };
+            } catch(e) {}
+
             try {
                 var origFetch = window.fetch;
                 window.fetch = function(input, init) {
                     var url = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
                     var p = origFetch.apply(this, arguments);
-                    if (url && (url.indexOf('/youtubei/v1/player') !== -1 || url.indexOf('/youtubei/v1/next') !== -1)) {
+                    if (url && (url.indexOf('/youtubei/v1/player') !== -1 || url.indexOf('/youtubei/v1/next') !== -1 || url.indexOf('pbj=1') !== -1)) {
                         return p.then(function(resp) {
                             try {
                                 var cloned = resp.clone();
                                 return cloned.text().then(function(txt) {
                                     try {
                                         var data = JSON.parse(txt);
-                                        stripAds(data);
-                                        if (data && data.playerResponse) stripAds(data.playerResponse);
+                                        stripAds(data, 0);
                                         var headers = new Headers(resp.headers);
                                         headers.delete('content-length');
                                         headers.delete('content-encoding');
@@ -737,7 +766,6 @@ fun YouTubeTabScreen(
         })();
     """.trimIndent()
 
-    // Trusted-Types নিরাপদ (textContent ব্যবহার করে) CSS + ব্যাকগ্রাউন্ড প্লে + অ্যাড-স্কিপার + ১৬:৯ বড় প্লেয়ার
     val bgScript = """
         (function() {
             try {
@@ -859,10 +887,16 @@ fun YouTubeTabScreen(
                                     v.muted = true;
                                 }
                                 try { v.playbackRate = 16; } catch(e) {}
-                                if (isFinite(v.duration) && v.duration > 0.3 && v.currentTime < v.duration - 0.1) {
-                                    v.currentTime = v.duration - 0.05;
+                                if (v.paused) {
+                                    v.play().catch(function(){});
                                 }
-                                document.querySelectorAll('#player-container-id .ytp-ad-skip-button, #player-container-id .ytp-ad-skip-button-modern, #player-container-id .ytp-skip-ad-button, #player-container-id [id^="skip-button"], #player-container-id button').forEach(function(btn) {
+                                if (isFinite(v.duration) && v.duration > 0.2) {
+                                    v.currentTime = v.duration;
+                                }
+                                try {
+                                    if (player && typeof player.skipAd === 'function') player.skipAd();
+                                } catch(e) {}
+                                document.querySelectorAll('#player-container-id .ytp-ad-skip-button, #player-container-id .ytp-ad-skip-button-modern, #player-container-id .ytp-skip-ad-button, #player-container-id .ytp-ad-skip-button-slot button, #player-container-id [id^="skip-button"], #player-container-id button').forEach(function(btn) {
                                     var t = (btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '').trim().toLowerCase();
                                     if (t === 'skip' || t === 'skip ad' || t === 'skip ads') {
                                         btn.click();
@@ -872,6 +906,9 @@ fun YouTubeTabScreen(
                                 window.__ultraAdMuted = false;
                                 v.muted = false;
                                 try { v.playbackRate = 1; } catch(e) {}
+                                if (v.paused && !v.ended) {
+                                    v.play().catch(function(){});
+                                }
                             }
                         } catch(e) {}
                     }
@@ -918,13 +955,12 @@ fun YouTubeTabScreen(
                         } catch(e) {}
                     }
 
-                    // দ্রুত অ্যাড-স্কিপার ও প্লেয়ার সাইজ লুপ
                     setInterval(function() {
                         skipVideoAdsIfAny();
                         updateWatchSizeClass();
                         var v = document.querySelector('video');
                         hookVideo(v);
-                    }, 150);
+                    }, 100);
 
                     setInterval(function() {
                         hideOpenAppButtons();
@@ -1252,7 +1288,9 @@ fun MuzioMusicTabScreen(
     DisposableEffect(Unit) {
         val token = SessionToken(context, ComponentName(context, MusicPlaybackService::class.java))
         val future = MediaController.Builder(context, token).buildAsync()
-        future.addListener({ mediaController = future.get() }, ContextCompat.getMainExecutor(context))
+        future.addListener({
+            try { mediaController = future.get() } catch (_: Exception) { }
+        }, ContextCompat.getMainExecutor(context))
         onDispose { mediaController?.release() }
     }
 
@@ -1262,12 +1300,38 @@ fun MuzioMusicTabScreen(
         }
     }
 
+    fun connectAndRun(action: (MediaController) -> Unit) {
+        val existing = mediaController
+        if (existing != null && existing.isConnected) {
+            action(existing)
+            return
+        }
+        val token = SessionToken(context, ComponentName(context, MusicPlaybackService::class.java))
+        val future = MediaController.Builder(context, token).buildAsync()
+        future.addListener({
+            try {
+                val ctrl = future.get()
+                mediaController = ctrl
+                action(ctrl)
+            } catch (_: Exception) { }
+        }, ContextCompat.getMainExecutor(context))
+    }
+
     fun playSong(song: MediaFile) {
         onSongChanged(song)
-        mediaController?.apply {
-            setMediaItem(MediaItem.fromUri(song.uri))
-            prepare()
-            play()
+        val item = MediaItem.Builder()
+            .setUri(song.uri)
+            .setMediaMetadata(
+                Media3Metadata.Builder()
+                    .setTitle(song.title)
+                    .setArtist(song.artist)
+                    .build()
+            )
+            .build()
+        connectAndRun { ctrl ->
+            ctrl.setMediaItem(item)
+            ctrl.prepare()
+            ctrl.play()
         }
     }
 
@@ -1340,16 +1404,27 @@ fun MuzioMusicTabScreen(
     LaunchedEffect(mediaController) {
         while (true) {
             mediaController?.let { ctrl ->
-                isPlaying = ctrl.isPlaying
-                currentPos = ctrl.currentPosition.coerceAtLeast(0L)
-                totalDur = ctrl.duration.coerceAtLeast(1L)
+                if (ctrl.isConnected) {
+                    isPlaying = ctrl.isPlaying
+                    currentPos = ctrl.currentPosition.coerceAtLeast(0L)
+                    totalDur = ctrl.duration.coerceAtLeast(1L)
+                    // নোটিফিকেশনের Close (×) বাটন চেপে বন্ধ করলে মিনি-প্লেয়ারও অটোমেটিক সরে যাবে
+                    if (ctrl.mediaItemCount == 0 && latestSong != null) {
+                        onSongChanged(null)
+                        showFullPlayer = false
+                    }
+                }
             }
             delay(400)
         }
     }
 
     fun stopAndDismissMiniPlayer() {
-        mediaController?.stop()
+        mediaController?.apply {
+            pause()
+            stop()
+            clearMediaItems()
+        }
         onSongChanged(null)
         showFullPlayer = false
     }
